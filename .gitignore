@@ -1,0 +1,25 @@
+# Ignore build artifacts
+/build/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Compiled object files and executables
+*.o
+*.obj
+*.exe
+*.out
+
+# Generated LLVM files and assembly
+*.ll
+*.s
+
+# Temporary files
+*~
+*.swp
+
+# VSCode settings
+.vscode/
