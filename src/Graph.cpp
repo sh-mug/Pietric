@@ -3,6 +3,7 @@
 #include <iostream>
 #include <algorithm>
 #include <map>
+#include <set>
 
 // Helper: returns true if (r, c) is within the grid bounds.
 static bool inBounds(int r, int c, int rows, int cols) {
@@ -284,10 +285,60 @@ void Graph::buildGraph(const std::vector<std::vector<PietColor>> &grid) {
         }
 
         // If the candidate is white, follow the white region until reaching a colored block.
-        while (inBounds(candidate.first, candidate.second, rows, cols) &&
-               grid[candidate.first][candidate.second] == PietColor::White) {
-            candidate = getNextCodel(candidate, trialDP);
+        // while (inBounds(candidate.first, candidate.second, rows, cols) &&
+        //        grid[candidate.first][candidate.second] == PietColor::White) {
+        //     candidate = getNextCodel(candidate, trialDP);
+        // }
+        bool slidedWhite = inBounds(candidate.first, candidate.second, rows, cols) &&
+                           grid[candidate.first][candidate.second] == PietColor::White;
+        if (slidedWhite) {
+            // We now slide through white blocks according to the Piet specification.
+            // Save the starting white sliding state for cycle detection.
+            std::set<std::tuple<std::pair<int,int>, Direction, CodelChooser>> visitedWhite;
+            visitedWhite.emplace(candidate, trialDP, trialCC);
+            std::pair<int,int> lastWhite = candidate;
+        
+            // Loop to slide through the white region.
+            while (true) {
+                // Slide in a straight line along the DP while the candidate is white.
+                while (inBounds(candidate.first, candidate.second, rows, cols) &&
+                       grid[candidate.first][candidate.second] == PietColor::White) {
+                    lastWhite = candidate; // record the last white codel encountered
+                    candidate = getNextCodel(candidate, trialDP);
+                }
+                
+                // Now candidate is either out-of-bounds, black, or colored.
+                if (!inBounds(candidate.first, candidate.second, rows, cols) ||
+                    grid[candidate.first][candidate.second] == PietColor::Black) {
+                    // A restriction is encountered while sliding.
+                    // According to the specification, toggle the CC and rotate the DP clockwise.
+                    trialCC = toggleCC(trialCC);
+                    trialDP = rotateDP(trialDP, 1);
+        
+                    // Check if we have begun retracing our route: if we have returned to the
+                    // initial white sliding state (same candidate, DP, and CC), then there is no way out.
+                    if (visitedWhite.find({candidate, trialDP, trialCC}) != visitedWhite.end()) {
+                        foundExit = false;
+                        break; // No exit possible; break out of white-sliding loop.
+                    }
+                    visitedWhite.emplace(lastWhite, trialDP, trialCC);
+                    // Otherwise, reset candidate to the last white codel encountered
+                    // and try sliding again in the new direction.
+                    candidate = lastWhite;
+                    continue; // Reattempt the sliding with updated trialDP/trialCC.
+                } else {
+                    // Candidate is a colored codel (neither white, black, nor out-of-bounds).
+                    // We have an exit.
+                    break;
+                }
+            }
         }
+        if (!foundExit) {
+            // Handle the terminal case: no exit was found from the white region.
+            // (For example, you may mark the current state as terminal and/or break out.)
+            continue;  // or set the appropriate termination condition.
+        }
+
         // If out-of-bounds or black after following white, then terminate.
         if (!inBounds(candidate.first, candidate.second, rows, cols) ||
             grid[candidate.first][candidate.second] == PietColor::Black)
@@ -298,7 +349,8 @@ void Graph::buildGraph(const std::vector<std::vector<PietColor>> &grid) {
             continue;
 
         // Compute the command from current block color to the target block's color.
-        Command cmd = getCommand(curBlock.color, blocks[targetBlockId].color);
+        Command cmd = slidedWhite ? Command::None
+                                  : getCommand(curBlock.color, blocks[targetBlockId].color);
 
         // Determine possible new DP/CC outcomes.
         std::vector<std::pair<Direction, CodelChooser>> outcomes;
