@@ -38,7 +38,6 @@ set(SOURCES
     src/Parser.cpp
     src/Graph.cpp
     src/IRBuilder.cpp
-    src/StackVM.cpp
     src/ImageLoader.cpp
 )
 
