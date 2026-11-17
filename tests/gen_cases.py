@@ -218,6 +218,11 @@ def zero():
     return ["push 1", "not"]
 
 
+# Pushes -2147483648 (2^16 * 2^15, which wraps around in 32 bits).
+INT_MIN = ["push 2", "dup", "mul", "dup", "mul", "dup", "mul", "dup", "mul",
+           "dup", "push 2", "div", "mul"]
+
+
 CASES = [
     # name, layout, program, expected output, stdin
     ("arith_basic", linear,
@@ -272,6 +277,28 @@ CASES = [
      b"1521", None),
     ("roll_negative_depth", linear,
      ["push 7"] + neg(1) + ["push 1", "roll", "outn", "outn", "outn"], b"1-17", None),
+
+    # Division truncates; mod has the sign of the divisor.
+    ("div_trunc", linear,
+     ["push 7", "push 2", "div", "outn"] + SPACE +
+     neg(7) + ["push 2", "div", "outn"] + SPACE +
+     ["push 7"] + neg(2) + ["div", "outn"] + SPACE +
+     neg(7) + neg(2) + ["div", "outn"],
+     b"3 -3 -3 3", None),
+    ("mod_sign", linear,
+     ["push 7", "push 3", "mod", "outn"] + SPACE +
+     neg(7) + ["push 3", "mod", "outn"] + SPACE +
+     ["push 7"] + neg(3) + ["mod", "outn"] + SPACE +
+     neg(7) + neg(3) + ["mod", "outn"] + SPACE +
+     ["push 6"] + neg(3) + ["mod", "outn"],
+     b"1 2 -2 -1 0", None),
+    # Division by zero is ignored; the operands stay on the stack.
+    ("div_zero", linear, ["push 5"] + zero() + ["div", "outn", "outn"], b"05", None),
+    ("mod_zero", linear, ["push 5"] + zero() + ["mod", "outn", "outn"], b"05", None),
+    # INT_MIN / -1 wraps around; INT_MIN mod -1 is 0.
+    ("div_overflow", linear,
+     INT_MIN + ["dup"] + neg(1) + ["div", "outn"] + SPACE + neg(1) + ["mod", "outn"],
+     b"-2147483648 0", None),
 ]
 
 

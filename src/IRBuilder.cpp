@@ -42,6 +42,8 @@ private:
     template <typename F> void emitIfStackHas(int count, F then);
     // Emits a command that pops two values and pushes op(second, top).
     template <typename F> void emitBinary(F op);
+    // Emits divide or modulo.
+    void emitDivMod(Command cmd);
     // Emits an input command: calls `readF` and pushes the value if one was read.
     void emitInput(FunctionCallee readF);
 
@@ -115,6 +117,40 @@ template <typename F> void CodeGen::emitBinary(F op) {
     });
 }
 
+void CodeGen::emitDivMod(Command cmd) {
+    emitIfStackHas(2, [&] {
+        Value *divisor = pop();
+        Value *dividend = pop();
+        // Division by zero is an implementation-defined error; as the specification
+        // recommends, the command is ignored and the operands stay on the stack.
+        emitIfElse(builder.CreateICmpEQ(divisor, constant(0)),
+            [&] {
+                push(dividend);
+                push(divisor);
+            },
+            [&] {
+                // sdiv/srem of INT_MIN by -1 is undefined behaviour in LLVM IR, so divide by 1
+                // instead and fix up the result: x / -1 is -x (wrapping) and x mod -1 is 0.
+                Value *isMinusOne = builder.CreateICmpEQ(divisor, constant(-1));
+                Value *safeDivisor = builder.CreateSelect(isMinusOne, constant(1), divisor);
+                if (cmd == Command::Divide) {
+                    // Integer division truncates towards zero.
+                    Value *quotient = builder.CreateSDiv(dividend, safeDivisor);
+                    push(builder.CreateSelect(isMinusOne, builder.CreateNeg(dividend), quotient));
+                } else {
+                    // srem takes the sign of the dividend, but the result of mod has the sign
+                    // of the divisor: add the divisor when the signs differ.
+                    Value *rem = builder.CreateSRem(dividend, safeDivisor);
+                    Value *signsDiffer = builder.CreateICmpSLT(builder.CreateXor(rem, divisor),
+                                                               constant(0));
+                    Value *adjust = builder.CreateAnd(builder.CreateICmpNE(rem, constant(0)),
+                                                      signsDiffer);
+                    push(builder.CreateSelect(adjust, builder.CreateAdd(rem, divisor), rem));
+                }
+            });
+    });
+}
+
 void CodeGen::emitInput(FunctionCallee readF) {
     // If nothing can be read (e.g. at end of input), the command is ignored.
     Value *ok = builder.CreateCall(readF, { inputSlot });
@@ -141,10 +177,8 @@ void CodeGen::emitCommand(Command cmd, int blockSize) {
             emitBinary([&](Value *a, Value *b) { return builder.CreateMul(a, b); });
             break;
         case Command::Divide:
-            emitBinary([&](Value *a, Value *b) { return builder.CreateSDiv(a, b); });
-            break;
         case Command::Modulo:
-            emitBinary([&](Value *a, Value *b) { return builder.CreateSRem(a, b); });
+            emitDivMod(cmd);
             break;
         case Command::Not:
             emitIfStackHas(1, [&] {
