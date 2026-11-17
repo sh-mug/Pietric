@@ -2,7 +2,6 @@
 #include <queue>
 #include <iostream>
 #include <algorithm>
-#include <map>
 #include <set>
 
 // Helper: returns true if (r, c) is within the grid bounds.
@@ -18,6 +17,7 @@ void Graph::computeBlocks(const std::vector<std::vector<PietColor>> &grid) {
     if (rows == 0) return;
     int cols = grid[0].size();
     std::vector<std::vector<bool>> visited(rows, std::vector<bool>(cols, false));
+    blockIdGrid.assign(rows, std::vector<int>(cols, -1));
     int blockId = 0;
     const int dr[4] = { -1, 1, 0, 0 };
     const int dc[4] = { 0, 0, -1, 1 };
@@ -39,6 +39,7 @@ void Graph::computeBlocks(const std::vector<std::vector<PietColor>> &grid) {
                 auto [cr, cc] = q.front();
                 q.pop();
                 block.cells.push_back({cr, cc});
+                blockIdGrid[cr][cc] = block.id;
                 block.size++;
                 for (int i = 0; i < 4; ++i) {
                     int nr = cr + dr[i], nc = cc + dc[i];
@@ -171,15 +172,12 @@ std::pair<int,int> Graph::getNextCodel(const std::pair<int,int>& coord, Directio
 }
 
 // --- Helper: findBlockId ---
-// Look through the computed blocks to find one that contains (r,c).
+// Return the id of the block that contains (r,c), or -1 if (r,c) is outside the grid.
 int Graph::findBlockId(int r, int c) const {
-    for (const auto &b : blocks) {
-        for (const auto &cell : b.cells) {
-            if (cell.first == r && cell.second == c)
-                return b.id;
-        }
-    }
-    return -1;
+    if (r < 0 || r >= static_cast<int>(blockIdGrid.size()) ||
+        c < 0 || c >= static_cast<int>(blockIdGrid[r].size()))
+        return -1;
+    return blockIdGrid[r][c];
 }
 
 // --- Helper: rotateDP ---
@@ -213,15 +211,11 @@ void Graph::buildGraph(const std::vector<std::vector<PietColor>> &grid) {
 
     // Worklist: store indices of nodes to process.
     std::vector<int> worklist;
-    // Map key: (blockId, dp, cc) encoded as a tuple; value: node id.
-    struct StateKey { int blockId; int dp; int cc; };
-    auto keyHash = [](const StateKey &k) { return k.blockId * 100 + k.dp * 10 + k.cc; };
-    std::vector<StateKey> stateKeys;
-    std::map<int, int> stateMap; // keyHash -> node id (for simplicity; collisions are unlikely for our demo)
-
-    auto makeKey = [&](int bid, Direction d, CodelChooser c) -> int {
-        StateKey key{ bid, static_cast<int>(d), static_cast<int>(c) };
-        return keyHash(key);
+    // Node id of each state (blockId, dp, cc), or -1 if the state has not been created yet.
+    // A state is stored at index blockId * 8 + dp * 2 + cc.
+    std::vector<int> stateNode(blocks.size() * 8, -1);
+    auto makeKey = [](int bid, Direction d, CodelChooser c) -> size_t {
+        return static_cast<size_t>(bid) * 8 + static_cast<int>(d) * 2 + static_cast<int>(c);
     };
 
     // Create initial state.
@@ -233,7 +227,7 @@ void Graph::buildGraph(const std::vector<std::vector<PietColor>> &grid) {
     init.cc = CodelChooser::Left;
     nodes.push_back(init);
     worklist.push_back(0);
-    stateMap[makeKey(initialBlockId, init.dp, init.cc)] = 0;
+    stateNode[makeKey(initialBlockId, init.dp, init.cc)] = 0;
 
     int rows = grid.size();
     int cols = grid[0].size();
@@ -243,7 +237,7 @@ void Graph::buildGraph(const std::vector<std::vector<PietColor>> &grid) {
         int curId = worklist.back();
         worklist.pop_back();
         GraphNode curState = nodes[curId];
-        Block curBlock = blocks[curState.blockId];
+        const Block &curBlock = blocks[curState.blockId];
 
         // --- Attempt to compute a valid exit ---
         bool foundExit = false;
@@ -361,9 +355,9 @@ void Graph::buildGraph(const std::vector<std::vector<PietColor>> &grid) {
         for (const auto &outcome : outcomes) {
             Direction newDP = outcome.first;
             CodelChooser newCC = outcome.second;
-            int key = makeKey(targetBlockId, newDP, newCC);
+            size_t key = makeKey(targetBlockId, newDP, newCC);
             int targetNodeId;
-            if (stateMap.find(key) == stateMap.end()) {
+            if (stateNode[key] < 0) {
                 // Create a new state.
                 GraphNode newState;
                 newState.id = nodes.size();
@@ -373,10 +367,10 @@ void Graph::buildGraph(const std::vector<std::vector<PietColor>> &grid) {
                 newState.cc = newCC;
                 nodes.push_back(newState);
                 targetNodeId = newState.id;
-                stateMap[key] = targetNodeId;
+                stateNode[key] = targetNodeId;
                 worklist.push_back(targetNodeId);
             } else {
-                targetNodeId = stateMap[key];
+                targetNodeId = stateNode[key];
             }
             // Add an edge from the current state to the target state with the computed command.
             GraphEdge edge;

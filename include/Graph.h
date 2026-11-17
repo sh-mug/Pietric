@@ -38,6 +38,7 @@ private:
     };
     std::vector<GraphNode> nodes;
     std::vector<Block> blocks; // Computed connected color blocks.
+    std::vector<std::vector<int>> blockIdGrid; // Block id of every codel, indexed [row][col].
     
     // Compute connected color blocks from the grid.
     void computeBlocks(const std::vector<std::vector<PietColor>> &grid);
