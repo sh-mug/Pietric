@@ -2,6 +2,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cassert>
 
 using namespace llvm;
 
@@ -234,16 +235,36 @@ void CodeGen::emitCommand(Command cmd, int blockSize) {
     }
 }
 
+// The graph gives a pointer node four successors, transitions[i] being the state after turning the
+// DP clockwise i times, and a switch node two, transitions[i] being the state after toggling the
+// CC i times.
 void CodeGen::emitBranch(const GraphNode &node, const std::vector<BasicBlock *> &bbNodes) {
-    Value *choice = pop();
-    // For safety, compute modulo (#edges) by using an unsigned remainder.
+    Command cmd = node.transitions[0].command;
     int numEdges = node.transitions.size();
-    Value *index = builder.CreateURem(choice, constant(numEdges), "choiceIndex");
+    assert(numEdges == (cmd == Command::Pointer ? 4 : 2));
+    BasicBlock *unchangedBB = bbNodes[node.transitions[0].targetNode];
 
-    // Create a switch instruction that branches to each target basic block.
-    BasicBlock *defaultBB = bbNodes[node.transitions[0].targetNode]; // arbitrary default.
-    SwitchInst *swInst = builder.CreateSwitch(index, defaultBB, numEdges);
-    for (int j = 0; j < numEdges; j++)
+    // With an empty stack the command is ignored and DP and CC stay as they are.
+    BasicBlock *selectBB = BasicBlock::Create(ctx, "select", mainFunc);
+    builder.CreateCondBr(builder.CreateICmpSGT(stackSize(), constant(0)), selectBB, unchangedBB);
+    builder.SetInsertPoint(selectBB);
+
+    Value *value = pop();
+    Value *index;
+    if (cmd == Command::Pointer) {
+        // Turn clockwise `value` times, or anticlockwise if negative: -1 is the same as 3, so
+        // the index is value mod 4 rounded towards negative infinity, in 0..3.
+        Value *rem = builder.CreateSRem(value, constant(4));
+        Value *isNegative = builder.CreateICmpSLT(rem, constant(0));
+        index = builder.CreateSelect(isNegative, builder.CreateAdd(rem, constant(4)), rem);
+    } else {
+        // Toggle |value| times: only whether that is odd matters.
+        Value *rem = builder.CreateSRem(value, constant(2));
+        index = builder.CreateZExt(builder.CreateICmpNE(rem, constant(0)), i32);
+    }
+
+    SwitchInst *swInst = builder.CreateSwitch(index, unchangedBB, numEdges - 1);
+    for (int j = 1; j < numEdges; j++)
         swInst->addCase(constant(j), bbNodes[node.transitions[j].targetNode]);
 }
 
@@ -281,13 +302,14 @@ void CodeGen::emit(const Graph &graph) {
             // Terminal state: destroy stack and return.
             builder.CreateCall(destroyStackF, { stack });
             builder.CreateRet(constant(0));
-        } else if (node.transitions.size() == 1) {
+        } else if (node.transitions[0].command == Command::Pointer ||
+                   node.transitions[0].command == Command::Switch) {
+            // Pointer or switch: the popped value selects the successor.
+            emitBranch(node, bbNodes);
+        } else {
             // Single transition: execute the command, then go to the sole successor.
             emitCommand(node.transitions[0].command, node.blockSize);
             builder.CreateBr(bbNodes[node.transitions[0].targetNode]);
-        } else {
-            // Pointer or switch: the popped value selects the successor.
-            emitBranch(node, bbNodes);
         }
     }
 }

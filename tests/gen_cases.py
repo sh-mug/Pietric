@@ -90,7 +90,6 @@ def pointer_split(program):
     assert program[-1] == "ptr"
     cells, b = lay_out_row(program)
     k = len(cells)
-    assert k >= 2
     r = hexof(step(b, "outn"))
     d = hexof(step(b, "outc"))
     row0 = cells + [hexof(b), r, WHITE]
@@ -299,6 +298,23 @@ CASES = [
     ("div_overflow", linear,
      INT_MIN + ["dup"] + neg(1) + ["div", "outn"] + SPACE + neg(1) + ["mod", "outn"],
      b"-2147483648 0", None),
+
+    # pointer turns DP clockwise by the popped value mod 4 (anticlockwise if
+    # negative). Stack below the value: 65; "A" means DP down, "65" right or up.
+    ("pointer_1", pointer_split, PUSH_65 + ["push 1", "ptr"], b"A", None),
+    ("pointer_5", pointer_split, PUSH_65 + ["push 5", "ptr"], b"A", None),
+    ("pointer_neg3", pointer_split, PUSH_65 + neg(3) + ["ptr"], b"A", None),
+    ("pointer_neg7", pointer_split, PUSH_65 + neg(7) + ["ptr"], b"A", None),
+    ("pointer_4", pointer_split, PUSH_65 + ["push 4", "ptr"], b"65", None),
+    ("pointer_neg1", pointer_split, PUSH_65 + neg(1) + ["ptr"], b"65", None),
+    ("pointer_neg4", pointer_split, PUSH_65 + neg(4) + ["ptr"], b"65", None),
+
+    # switch toggles CC |value| times. "A" means CC right, "65" CC left.
+    ("switch_1", switch_split, PUSH_65 + ["push 1", "sw"], b"A", None),
+    ("switch_2", switch_split, PUSH_65 + ["push 2", "sw"], b"65", None),
+    ("switch_3", switch_split, PUSH_65 + ["push 3", "sw"], b"A", None),
+    ("switch_neg1", switch_split, PUSH_65 + neg(1) + ["sw"], b"A", None),
+    ("switch_neg2", switch_split, PUSH_65 + neg(2) + ["sw"], b"65", None),
 ]
 
 
