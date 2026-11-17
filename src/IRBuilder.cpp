@@ -5,183 +5,194 @@
 
 using namespace llvm;
 
-IRGenerator::IRGenerator(LLVMContext &ctx) : context(ctx) { }
+namespace {
 
-Module* IRGenerator::generateModule(const Graph &graph) {
-    Module *module = new Module("PietModule", context);
-    IRBuilder<> builder(context);
+// Emits main() for an execution graph. Every graph node becomes a basic block
+// that performs the command of its outgoing edge and branches to the
+// successor node; the stack lives in the runtime library (StackVM.cpp).
+class CodeGen {
+public:
+    CodeGen(LLVMContext &ctx, Module &module);
+    void emit(const Graph &graph);
 
-    // Declare external runtime functions.
-    PointerType *stackPtrTy = PointerType::getUnqual(Type::getInt8Ty(context));
+private:
+    LLVMContext &ctx;
+    Module &module;
+    IRBuilder<> builder;
+    IntegerType *i32;
+    Function *mainFunc = nullptr;
+    Value *stack = nullptr;
 
-    FunctionType *pushType = FunctionType::get(Type::getVoidTy(context),
-                                               {stackPtrTy, Type::getInt32Ty(context)}, false);
-    Function *stackPushF = Function::Create(pushType, Function::ExternalLinkage, "stackPush", module);
+    // Runtime library functions.
+    FunctionCallee stackPushF, stackPopF, createStackF, destroyStackF, stackRollF;
+    FunctionCallee putcharF;
 
-    FunctionType *popType = FunctionType::get(Type::getInt32Ty(context),
-                                              {stackPtrTy}, false);
-    Function *stackPopF = Function::Create(popType, Function::ExternalLinkage, "stackPop", module);
+    ConstantInt *constant(int value) { return ConstantInt::get(i32, value); }
+    Value *pop() { return builder.CreateCall(stackPopF, { stack }); }
+    void push(Value *value) { builder.CreateCall(stackPushF, { stack, value }); }
 
-    FunctionType *createType = FunctionType::get(stackPtrTy, {}, false);
-    Function *createStackF = Function::Create(createType, Function::ExternalLinkage, "createStack", module);
+    // Emits the command executed when leaving a block of `blockSize` codels.
+    void emitCommand(Command cmd, int blockSize);
+    // Emits a multi-way branch on the value popped by a pointer or switch command.
+    void emitBranch(const GraphNode &node, const std::vector<BasicBlock *> &bbNodes);
+};
 
-    FunctionType *destroyType = FunctionType::get(Type::getVoidTy(context),
-                                                  {stackPtrTy}, false);
-    Function *destroyStackF = Function::Create(destroyType, Function::ExternalLinkage, "destroyStack", module);
+CodeGen::CodeGen(LLVMContext &ctx, Module &module)
+    : ctx(ctx), module(module), builder(ctx), i32(Type::getInt32Ty(ctx)) {
+    Type *voidTy = Type::getVoidTy(ctx);
+    PointerType *stackPtrTy = PointerType::getUnqual(Type::getInt8Ty(ctx));
 
-    FunctionType *rollType = FunctionType::get(Type::getVoidTy(context),
-                                               {stackPtrTy, Type::getInt32Ty(context), Type::getInt32Ty(context)},
-                                               false);
-    Function *stackRollF = Function::Create(rollType, Function::ExternalLinkage, "stackRoll", module);
+    stackPushF = module.getOrInsertFunction(
+        "stackPush", FunctionType::get(voidTy, { stackPtrTy, i32 }, false));
+    stackPopF = module.getOrInsertFunction(
+        "stackPop", FunctionType::get(i32, { stackPtrTy }, false));
+    createStackF = module.getOrInsertFunction(
+        "createStack", FunctionType::get(stackPtrTy, {}, false));
+    destroyStackF = module.getOrInsertFunction(
+        "destroyStack", FunctionType::get(voidTy, { stackPtrTy }, false));
+    stackRollF = module.getOrInsertFunction(
+        "stackRoll", FunctionType::get(voidTy, { stackPtrTy, i32, i32 }, false));
+    putcharF = module.getOrInsertFunction(
+        "putchar", FunctionType::get(i32, { i32 }, false));
+}
 
-    FunctionType *putcharType = FunctionType::get(Type::getInt32Ty(context),
-                                                  {Type::getInt32Ty(context)}, false);
-    Function *putcharF = Function::Create(putcharType, Function::ExternalLinkage, "putchar", module);
+void CodeGen::emitCommand(Command cmd, int blockSize) {
+    switch (cmd) {
+        case Command::Push:
+            push(constant(blockSize));
+            break;
+        case Command::Pop:
+            pop();
+            break;
+        case Command::Add: {
+            Value *a = pop();
+            Value *b = pop();
+            push(builder.CreateAdd(a, b));
+            break;
+        }
+        case Command::Subtract: {
+            Value *a = pop();
+            Value *b = pop();
+            push(builder.CreateSub(b, a));
+            break;
+        }
+        case Command::Multiply: {
+            Value *a = pop();
+            Value *b = pop();
+            push(builder.CreateMul(a, b));
+            break;
+        }
+        case Command::Divide: {
+            Value *a = pop();
+            Value *b = pop();
+            push(builder.CreateSDiv(b, a));
+            break;
+        }
+        case Command::Modulo: {
+            Value *a = pop();
+            Value *b = pop();
+            push(builder.CreateSRem(b, a));
+            break;
+        }
+        case Command::Not: {
+            Value *a = pop();
+            Value *isZero = builder.CreateICmpEQ(a, constant(0));
+            push(builder.CreateSelect(isZero, constant(1), constant(0)));
+            break;
+        }
+        case Command::Greater: {
+            Value *a = pop();
+            Value *b = pop();
+            Value *greater = builder.CreateICmpSGT(b, a);
+            push(builder.CreateSelect(greater, constant(1), constant(0)));
+            break;
+        }
+        case Command::Duplicate: {
+            Value *top = pop();
+            push(top);
+            push(top);
+            break;
+        }
+        case Command::Roll: {
+            Value *rolls = pop();
+            Value *depth = pop();
+            builder.CreateCall(stackRollF, { stack, rolls, depth });
+            break;
+        }
+        case Command::OutputChar: {
+            Value *ch = pop();
+            builder.CreateCall(putcharF, { builder.CreateIntCast(ch, i32, false) });
+            break;
+        }
+        default:
+            break;
+    }
+}
 
+void CodeGen::emitBranch(const GraphNode &node, const std::vector<BasicBlock *> &bbNodes) {
+    Value *choice = pop();
+    // For safety, compute modulo (#edges) by using an unsigned remainder.
+    int numEdges = node.transitions.size();
+    Value *index = builder.CreateURem(choice, constant(numEdges), "choiceIndex");
+
+    // Create a switch instruction that branches to each target basic block.
+    BasicBlock *defaultBB = bbNodes[node.transitions[0].targetNode]; // arbitrary default.
+    SwitchInst *swInst = builder.CreateSwitch(index, defaultBB, numEdges);
+    for (int j = 0; j < numEdges; j++)
+        swInst->addCase(constant(j), bbNodes[node.transitions[j].targetNode]);
+}
+
+void CodeGen::emit(const Graph &graph) {
     // Create main function: int main()
-    FunctionType *mainType = FunctionType::get(Type::getInt32Ty(context), false);
-    Function *mainFunc = Function::Create(mainType, Function::ExternalLinkage, "main", module);
-    BasicBlock *entryBB = BasicBlock::Create(context, "entry", mainFunc);
+    mainFunc = Function::Create(FunctionType::get(i32, false), Function::ExternalLinkage,
+                                "main", module);
+    BasicBlock *entryBB = BasicBlock::Create(ctx, "entry", mainFunc);
     builder.SetInsertPoint(entryBB);
 
     // Create the runtime stack.
-    CallInst *stackInst = builder.CreateCall(createStackF, {});
+    stack = builder.CreateCall(createStackF, {});
 
-    // Retrieve the execution graph.
-    const std::vector<GraphNode>& nodes = graph.getNodes();
+    const std::vector<GraphNode> &nodes = graph.getNodes();
     if (nodes.empty()) {
-        builder.CreateRet(ConstantInt::get(Type::getInt32Ty(context), 0));
-        return module;
+        builder.CreateRet(constant(0));
+        return;
     }
 
     // Create a basic block for each graph node.
-    std::vector<BasicBlock*> bbNodes;
-    for (size_t i = 0; i < nodes.size(); ++i) {
-        bbNodes.push_back(BasicBlock::Create(context, "node" + std::to_string(i), mainFunc));
-    }
+    std::vector<BasicBlock *> bbNodes;
+    for (size_t i = 0; i < nodes.size(); ++i)
+        bbNodes.push_back(BasicBlock::Create(ctx, "node" + std::to_string(i), mainFunc));
 
     // Branch from entry to the initial node.
     builder.CreateBr(bbNodes[0]);
 
-    // For each node, generate code.
     for (size_t i = 0; i < nodes.size(); ++i) {
         builder.SetInsertPoint(bbNodes[i]);
         const GraphNode &node = nodes[i];
-        
-        // Now, branch based on outgoing transitions.
+
         if (node.transitions.empty()) {
             // Terminal state: destroy stack and return.
-            builder.CreateCall(destroyStackF, { stackInst });
-            builder.CreateRet(ConstantInt::get(Type::getInt32Ty(context), 0));
+            builder.CreateCall(destroyStackF, { stack });
+            builder.CreateRet(constant(0));
         } else if (node.transitions.size() == 1) {
-            // Single transition: execute the command associated with the edge.
-            Command cmd = node.transitions[0].command;
-            // For arithmetic commands we simulate inline operations (this is similar to previous IR generation).
-            switch (cmd) {
-                case Command::Push: {
-                    builder.CreateCall(stackPushF,
-                        { stackInst, ConstantInt::get(Type::getInt32Ty(context), node.blockSize) });
-                    break;
-                }
-                case Command::Pop: {
-                    builder.CreateCall(stackPopF, { stackInst });
-                    break;
-                }
-                case Command::Add: {
-                    Value *a = builder.CreateCall(stackPopF, { stackInst });
-                    Value *b = builder.CreateCall(stackPopF, { stackInst });
-                    Value *sum = builder.CreateAdd(a, b);
-                    builder.CreateCall(stackPushF, { stackInst, sum });
-                    break;
-                }
-                case Command::Subtract: {
-                    Value *a = builder.CreateCall(stackPopF, { stackInst });
-                    Value *b = builder.CreateCall(stackPopF, { stackInst });
-                    Value *diff = builder.CreateSub(b, a);
-                    builder.CreateCall(stackPushF, { stackInst, diff });
-                    break;
-                }
-                case Command::Multiply: {
-                    Value *a = builder.CreateCall(stackPopF, { stackInst });
-                    Value *b = builder.CreateCall(stackPopF, { stackInst });
-                    Value *prod = builder.CreateMul(a, b);
-                    builder.CreateCall(stackPushF, { stackInst, prod });
-                    break;
-                }
-                case Command::Divide: {
-                    Value *a = builder.CreateCall(stackPopF, { stackInst });
-                    Value *b = builder.CreateCall(stackPopF, { stackInst });
-                    Value *quot = builder.CreateSDiv(b, a);
-                    builder.CreateCall(stackPushF, { stackInst, quot });
-                    break;
-                }
-                case Command::Modulo: {
-                    Value *a = builder.CreateCall(stackPopF, { stackInst });
-                    Value *b = builder.CreateCall(stackPopF, { stackInst });
-                    Value *rem = builder.CreateSRem(b, a);
-                    builder.CreateCall(stackPushF, { stackInst, rem });
-                    break;
-                }
-                case Command::Not: {
-                    Value *a = builder.CreateCall(stackPopF, { stackInst });
-                    Value *cmp = builder.CreateICmpEQ(a, ConstantInt::get(Type::getInt32Ty(context), 0));
-                    Value *result = builder.CreateSelect(cmp,
-                                             ConstantInt::get(Type::getInt32Ty(context), 1),
-                                             ConstantInt::get(Type::getInt32Ty(context), 0));
-                    builder.CreateCall(stackPushF, { stackInst, result });
-                    break;
-                }
-                case Command::Greater: {
-                    Value *a = builder.CreateCall(stackPopF, { stackInst });
-                    Value *b = builder.CreateCall(stackPopF, { stackInst });
-                    Value *cmp = builder.CreateICmpSGT(b, a);
-                    Value *result = builder.CreateSelect(cmp,
-                                             ConstantInt::get(Type::getInt32Ty(context), 1),
-                                             ConstantInt::get(Type::getInt32Ty(context), 0));
-                    builder.CreateCall(stackPushF, { stackInst, result });
-                    break;
-                }
-                case Command::Duplicate: {
-                    Value *top = builder.CreateCall(stackPopF, { stackInst });
-                    builder.CreateCall(stackPushF, { stackInst, top });
-                    builder.CreateCall(stackPushF, { stackInst, top });
-                    break;
-                }
-                case Command::Roll: {
-                    Value *rolls = builder.CreateCall(stackPopF, { stackInst });
-                    Value *depth = builder.CreateCall(stackPopF, { stackInst });
-                    builder.CreateCall(stackRollF, { stackInst, rolls, depth });
-                    break;
-                }
-                case Command::OutputChar: {
-                    Value *ch = builder.CreateCall(stackPopF, { stackInst });
-                    builder.CreateCall(putcharF, { builder.CreateIntCast(ch, Type::getInt32Ty(context), false) });
-                    break;
-                }
-                default:
-                    break;
-            }
-            // Unconditional branch to the sole successor.
+            // Single transition: execute the command, then go to the sole successor.
+            emitCommand(node.transitions[0].command, node.blockSize);
             builder.CreateBr(bbNodes[node.transitions[0].targetNode]);
         } else {
-            // Multiple transitions: pop an integer from the stack and use it to choose the branch.
-            Value *choice = builder.CreateCall(stackPopF, { stackInst });
-            // For safety, compute modulo (#edges) by using an unsigned remainder.
-            int numEdges = node.transitions.size();
-            Value *modVal = ConstantInt::get(Type::getInt32Ty(context), numEdges);
-            Value *index = builder.CreateURem(choice, modVal, "choiceIndex");
-
-            // Create a switch instruction that branches to each target basic block.
-            BasicBlock *defaultBB = bbNodes[node.transitions[0].targetNode]; // arbitrary default.
-            SwitchInst *swInst = builder.CreateSwitch(index, defaultBB, numEdges);
-            for (unsigned j = 0; j < node.transitions.size(); j++) {
-                int tgt = node.transitions[j].targetNode;
-                swInst->addCase(ConstantInt::get(Type::getInt32Ty(context), j), bbNodes[tgt]);
-            }
-            // (In a full implementation, the command would be executed as part of each transition.)
+            // Pointer or switch: the popped value selects the successor.
+            emitBranch(node, bbNodes);
         }
     }
-    // Verify the module.
+}
+
+} // namespace
+
+IRGenerator::IRGenerator(LLVMContext &ctx) : context(ctx) { }
+
+Module* IRGenerator::generateModule(const Graph &graph) {
+    Module *module = new Module("PietModule", context);
+    CodeGen codegen(context, *module);
+    codegen.emit(graph);
     verifyModule(*module, &errs());
     return module;
 }
