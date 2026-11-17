@@ -90,13 +90,20 @@ bool Parser::parseFile(const std::string &filename) {
         grid.clear();
         std::string line;
         while (std::getline(infile, line)) {
-            if (line.empty())
-                continue;
             std::istringstream iss(line);
             std::vector<PietColor> row;
             std::string token;
             while (iss >> token) {
                 row.push_back(hexToPietColor(token));
+            }
+            if (row.empty())
+                continue; // Skip blank lines.
+            // The rest of the compiler indexes the grid as a rectangle.
+            if (!grid.empty() && row.size() != grid[0].size()) {
+                std::cerr << "Error: row " << grid.size() + 1 << " has " << row.size()
+                          << " codels, but row 1 has " << grid[0].size() << "\n";
+                grid.clear();
+                return false;
             }
             grid.push_back(row);
         }
