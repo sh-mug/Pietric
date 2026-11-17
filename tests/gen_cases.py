@@ -309,6 +309,24 @@ CASES = [
     ("pointer_neg1", pointer_split, PUSH_65 + neg(1) + ["ptr"], b"65", None),
     ("pointer_neg4", pointer_split, PUSH_65 + neg(4) + ["ptr"], b"65", None),
 
+    # Deep stacks. Pietric tracks stack depths up to 16 at compile time;
+    # beyond that the values move to the heap, which grows when it is full
+    # (1024 values). Each case crosses the first limit; stack_grow both.
+    # 25 ones are summed; the last add finds a single value and is ignored.
+    ("stack_spill", linear,
+     ["push 1"] + ["dup"] * 24 + ["add"] * 24 + ["add", "outn"], b"25", None),
+    # [2 x 20, 3] rolled by 1 at depth 21 is [3, 2 x 20].
+    ("stack_spill_roll", linear,
+     ["push 2"] + ["dup"] * 19 + ["push 3", "push 3", "push 7", "mul", "push 1", "roll",
+                                  "outn"] + SPACE + ["add"] * 18 + ["outn"] + SPACE + ["outn"],
+     b"2 38 3", None),
+    ("stack_spill_input", linear,
+     ["push 1"] + ["dup"] * 20 + ["inc", "outc", "inc", "outn"], b"x1", b"x"),
+    ("stack_spill_pointer", pointer_split,
+     ["push 1"] + ["dup"] * 20 + PUSH_65 + ["push 1", "ptr"], b"A", None),
+    ("stack_grow", linear,
+     ["push 1"] + ["dup"] * 1199 + ["add"] * 1199 + ["outn"], b"1200", None),
+
     # switch toggles CC |value| times. "A" means CC right, "65" CC left.
     ("switch_1", switch_split, PUSH_65 + ["push 1", "sw"], b"A", None),
     ("switch_2", switch_split, PUSH_65 + ["push 2", "sw"], b"65", None),

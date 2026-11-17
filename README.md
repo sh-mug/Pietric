@@ -107,6 +107,8 @@ g++ output.o libPietRuntime.a -o output
 ```
 You can also integrate LLVM’s pass manager into your IR generation pipeline if desired.
 
+The generated code is laid out for the optimizer. Every state of the program is emitted once for each stack depth it can be reached with (up to 16), so that within each copy the depth is a constant and every stack value is an SSA value. The optimizer can then follow values through the whole program and fold everything that does not depend on input: `tests/cases/pietric.png`, for instance, becomes seven calls that print `pietric`. Deeper stacks continue in generic code that keeps the depth at run time, with the values in a heap buffer that grows as needed.
+
 ## Semantics
 
 Pietric follows the [Piet specification](https://www.dangermouse.net/esoteric/piet.html). Where the specification leaves a choice, Pietric behaves as follows:
