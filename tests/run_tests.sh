@@ -21,12 +21,14 @@ if [ $# -lt 6 ]; then
     exit 2
 fi
 
-pietric=$1
+# Pietric writes output.ll to its working directory, so it is run from a
+# scratch directory; make the file arguments absolute first.
+pietric=$(realpath "$1")
 llc=$2
 opt=$3
 cxx=$4
-runtime=$5
-cases=$6
+runtime=$(realpath "$5")
+cases=$(realpath "$6")
 filter=${7:-}
 
 compile_timeout=10
