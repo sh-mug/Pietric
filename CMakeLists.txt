@@ -4,6 +4,10 @@ project(Pietric)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 # Find LLVM (adjust if necessary for your installation)
 find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
@@ -39,24 +43,32 @@ set(SOURCES
     src/Graph.cpp
     src/IRBuilder.cpp
     src/Runtime.cpp
+    src/Backend.cpp
     src/ImageLoader.cpp
 )
 
 add_executable(Pietric ${SOURCES})
 
-llvm_map_components_to_libnames(llvm_libs support core irreader native)
+llvm_map_components_to_libnames(llvm_libs support core bitwriter targetparser)
 
 target_link_libraries(Pietric ${llvm_libs})
 
+# Pietric runs opt and llc from the LLVM it was built with (or else from the PATH).
+target_compile_definitions(Pietric PRIVATE PIETRIC_LLVM_TOOLS_DIR="${LLVM_TOOLS_BINARY_DIR}")
+
+# LLVM's static libraries are built with one section per function; let the linker drop the
+# unused ones.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE)
+  target_link_options(Pietric PRIVATE -Wl,--gc-sections)
+endif()
+
+# Code that uses LLVM's command-line library must match LLVM's RTTI setting.
+if(NOT LLVM_ENABLE_RTTI AND NOT MSVC)
+  target_compile_options(Pietric PRIVATE -fno-rtti)
+endif()
+
 # End-to-end tests (run with `ctest` from the build directory).
 enable_testing()
-find_program(PIET_LLC llc HINTS ${LLVM_TOOLS_BINARY_DIR})
-find_program(PIET_OPT opt HINTS ${LLVM_TOOLS_BINARY_DIR})
-if(PIET_LLC AND PIET_OPT)
-  add_test(NAME piet-programs
-    COMMAND ${CMAKE_SOURCE_DIR}/tests/run_tests.sh
-            $<TARGET_FILE:Pietric> ${PIET_LLC} ${PIET_OPT} ${CMAKE_C_COMPILER}
-            ${CMAKE_SOURCE_DIR}/tests/cases)
-else()
-  message(WARNING "llc/opt not found; end-to-end tests are disabled")
-endif()
+add_test(NAME piet-programs
+  COMMAND ${CMAKE_SOURCE_DIR}/tests/run_tests.sh
+          $<TARGET_FILE:Pietric> ${CMAKE_C_COMPILER} ${CMAKE_SOURCE_DIR}/tests/cases)

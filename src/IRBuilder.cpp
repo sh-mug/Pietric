@@ -1,8 +1,6 @@
 #include "IRBuilder.h"
 #include "Runtime.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/Verifier.h"
-#include "llvm/Support/raw_ostream.h"
 #include <cassert>
 #include <deque>
 #include <map>
@@ -531,6 +529,5 @@ Module* IRGenerator::generateModule(const Graph &graph) {
     Module *module = new Module("PietModule", context);
     CodeGen codegen(context, *module);
     codegen.emit(graph);
-    verifyModule(*module, &errs());
     return module;
 }

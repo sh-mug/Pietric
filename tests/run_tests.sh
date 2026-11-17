@@ -1,34 +1,29 @@
 #!/usr/bin/env bash
 # End-to-end tests: compile every Piet program in a cases directory with
-# Pietric, link it with a C compiler, run it and compare its stdout with the
-# expected output.
+# Pietric, run it and compare its stdout with the expected output.
 #
-# Usage: run_tests.sh <pietric> <llc> <opt> <cc> <cases-dir> [name-filter]
+# Usage: run_tests.sh <pietric> <cc> <cases-dir> [name-filter]
+#   <cc> is the C compiler Pietric links with.
 #
 # A test case <name> consists of
 #   <name>.txt|.png|.gif|.bmp  the Piet program
 #   <name>.out                 the expected stdout (byte for byte)
 #   <name>.in                  optional stdin
 #
-# Each program is built twice: unoptimized (llc -O0) and optimized
-# (opt -O2 + llc -O2), so behaviour that depends on undefined behaviour in
-# the generated IR tends to show up as a mismatch.
+# Each program is built twice, with -O0 and -O2, so behaviour that depends on
+# undefined behaviour in the generated IR tends to show up as a mismatch.
 
 set -u
 
-if [ $# -lt 5 ]; then
-    echo "usage: $0 <pietric> <llc> <opt> <cc> <cases-dir> [name-filter]" >&2
+if [ $# -lt 3 ]; then
+    echo "usage: $0 <pietric> <cc> <cases-dir> [name-filter]" >&2
     exit 2
 fi
 
-# Pietric writes output.ll to its working directory, so it is run from a
-# scratch directory; make the file arguments absolute first.
-pietric=$(realpath "$1")
-llc=$2
-opt=$3
-cc=$4
-cases=$(realpath "$5")
-filter=${6:-}
+pietric=$1
+cc=$2
+cases=$3
+filter=${4:-}
 
 compile_timeout=10
 run_timeout=5
@@ -69,24 +64,12 @@ for expected in "$cases"/*.out; do
 
     dir="$work/$name"
     mkdir -p "$dir"
-    if ! (cd "$dir" && timeout "$compile_timeout" "$pietric" "$src" > compile.log 2>&1); then
-        report_fail "$name" "Pietric failed or timed out (see output below)"
-        cat "$dir/compile.log"
-        continue
-    fi
 
     for mode in O0 O2; do
-        ll="$dir/output.ll"
-        if [ "$mode" = O2 ]; then
-            if ! "$opt" -O2 "$dir/output.ll" -S -o "$dir/opt.ll"; then
-                report_fail "$name [$mode]" "opt failed"
-                continue
-            fi
-            ll="$dir/opt.ll"
-        fi
-        if ! "$llc" "-$mode" -relocation-model=pic -filetype=obj "$ll" -o "$dir/prog.o" ||
-           ! "$cc" "$dir/prog.o" -o "$dir/prog"; then
-            report_fail "$name [$mode]" "llc or link failed"
+        if ! timeout "$compile_timeout" "$pietric" "-$mode" --cc "$cc" "$src" -o "$dir/prog" \
+                > "$dir/compile.log" 2>&1; then
+            report_fail "$name [$mode]" "Pietric failed or timed out (see output below)"
+            cat "$dir/compile.log"
             continue
         fi
         timeout "$run_timeout" "$dir/prog" < "$input" > "$dir/actual" 2> "$dir/stderr"

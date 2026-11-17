@@ -24,10 +24,8 @@ bool Parser::parseFile(const std::string &filename) {
     if (ext == "bmp" || ext == "png" || ext == "gif") {
         // --- IMAGE FILE HANDLING ---
         Image image;
-        if (!loadImage(filename, image)) {
-            std::cerr << "Failed to load image: " << filename << "\n";
-            return false;
-        }
+        if (!loadImage(filename, image))
+            return false;  // loadImage has reported why
         // Determine the maximum candidate codel size N such that
         // when dividing the image into non–overlapping N×N blocks, each block is uniform.
         int maxCandidate = 1;
@@ -60,8 +58,7 @@ bool Parser::parseFile(const std::string &filename) {
                 maxCandidate = n; // update candidate if this block size works.
             }
         }
-        int codelSize = maxCandidate;
-        std::cout << "Determined codel size: " << codelSize << "\n";
+        codelSize = maxCandidate;
 
         // Build the grid: each cell represents one codel.
         int rows = image.height / codelSize;
@@ -82,6 +79,7 @@ bool Parser::parseFile(const std::string &filename) {
         return true;
     } else {
         // --- TEXT FILE HANDLING (whitespace–separated hex codes) ---
+        codelSize = 1;
         std::ifstream infile(filename);
         if (!infile) {
             std::cerr << "Error: Cannot open file " << filename << "\n";

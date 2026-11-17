@@ -14,9 +14,12 @@ public:
     bool parseFile(const std::string &filename);
     // Returns the parsed grid (rows of codels)
     const std::vector<std::vector<PietColor>>& getGrid() const;
+    // Returns the size in pixels of a codel of an image (1 for text files).
+    int getCodelSize() const { return codelSize; }
 
 private:
     std::vector<std::vector<PietColor>> grid;
+    int codelSize = 1;
 };
 
 #endif // PARSER_H

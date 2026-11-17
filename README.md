@@ -15,15 +15,17 @@ Pietric/
 │   ├── Parser.h    
 │   ├── Graph.h  
 │   ├── IRBuilder.h  
-│   └── Runtime.h  
+│   ├── Runtime.h  
+│   └── Backend.h  
 ├── src/
-│   ├── main.cpp        # Main driver for the compiler
+│   ├── main.cpp        # Command-line driver: parses the options and runs the stages below
 │   ├── Utils.cpp       # Utility functions (e.g., hex string conversion)
 │   ├── Parser.cpp      # Parses input files (text files with hex codes or BMP/PNG/GIF images)
 │   ├── ImageLoader.cpp # Loads images using the stb_image library
 │   ├── Graph.cpp       # Builds the execution graph according to Piet’s DP and CC rules
 │   ├── IRBuilder.cpp   # Generates LLVM IR from the execution graph, with the stack operations inline
-│   └── Runtime.cpp     # Support functions emitted into the generated module (stack growth, roll, I/O)
+│   ├── Runtime.cpp     # Support functions emitted into the generated module (stack growth, roll, I/O)
+│   └── Backend.cpp     # Optimizes the module, generates machine code and links the executable
 └── tests/
     ├── run_tests.sh    # Compiles, runs and checks every program in cases/
     ├── gen_cases.py    # Generates the text-format test programs in cases/
@@ -57,53 +59,37 @@ This project uses CMake as its build system. To build the compiler:
    make
    ```
 
-This produces the compiler `Pietric` in the build directory.
+This produces the compiler `Pietric` in the build directory (a Release build unless `CMAKE_BUILD_TYPE` says otherwise).
 
 ## Using the Compiler
 
-The compiler accepts as input a Piet program, either as a text file (with whitespace-separated hex color codes) or as an image file (BMP, PNG, or GIF). The compiler then produces an LLVM IR file (`output.ll`) which you can compile further into an executable.
-
-### Step 1: Generate LLVM IR
-
-Run the compiler by specifying an input file:
+Pietric takes a Piet program, either an image (PNG, GIF or BMP) or a text file of whitespace-separated hex colour codes, and compiles it into an executable:
 ```bash
-./Pietric path/to/input_file
+./Pietric path/to/program.png -o program
+./program
 ```
-This parses your Piet program and outputs `output.ll` (the LLVM IR file) in the build directory.
+Behind the scenes Pietric runs LLVM's `opt` and `llc` (those of the LLVM it was built with, or else the ones on the `PATH`) to optimize the program and generate machine code for the host, and links it with the C compiler `cc`; the program needs only the C standard library.
 
-### Step 2: Compile the LLVM IR into an Executable
+Options:
 
-You can use LLVM’s tools and your system compiler to convert the IR into a runnable executable. For example:
+| Option | Effect |
+|---|---|
+| `-o <file>` | Output file. Default: `a.out` (or `<program>.ll` / `<program>.o` with `--emit-llvm` / `-c`) |
+| `-O0` … `-O3` | Optimization level (default `-O2`). `-O0` compiles fastest, which helps with very large programs |
+| `--emit-llvm` | Write LLVM IR, after optimization at the chosen level, instead of an executable |
+| `-c` | Write an object file instead of an executable |
+| `--cc=<program>` | C compiler used for linking (default `cc`) |
+| `-v` | Report the codel size detected in an image |
 
-1. **Compile to Object File**  
-   Use `llc` to compile the LLVM IR to an object file:
-   ```bash
-   llc output.ll -relocation-model=pic -filetype=obj -o output.o
-   ```
-   (`-relocation-model=pic` is needed when your linker produces position-independent executables, the default on most Linux distributions.)
-
-2. **Link**  
-   The program needs only the C standard library, so any C compiler can link it:
-   ```bash
-   cc output.o -o output
-   ```
-
-### Step 3: Run the Executable
-
-Once linked, run your executable:
+The IR from `--emit-llvm` can also be built with LLVM's tools, for example:
 ```bash
-./output
+./Pietric -O0 --emit-llvm program.png -o program.ll
+opt -O3 program.ll -S -o optimized.ll
+llc optimized.ll -relocation-model=pic -filetype=obj -o program.o
+cc program.o -o program
 ```
 
-## Optimizing the LLVM IR
-
-To optimize the generated LLVM IR, you can run LLVM’s optimization passes. For example, using the `opt` tool:
-```bash
-opt -O3 output.ll -S -o optimized.ll
-llc optimized.ll -relocation-model=pic -filetype=obj -o output.o
-cc output.o -o output
-```
-You can also integrate LLVM’s pass manager into your IR generation pipeline if desired.
+## Optimization
 
 The generated code is laid out for the optimizer. Every state of the program is emitted once for each stack depth it can be reached with (up to 16), so that within each copy the depth is a constant and every stack value is an SSA value. The optimizer can then follow values through the whole program and fold everything that does not depend on input: `tests/cases/pietric.png`, for instance, becomes seven calls that print `pietric`. Deeper stacks continue in generic code that keeps the depth at run time, with the values in a heap buffer that grows as needed.
 
@@ -124,13 +110,13 @@ Pietric follows the [Piet specification](https://www.dangermouse.net/esoteric/pi
 
 ## Testing
 
-The end-to-end tests compile each program in `tests/cases/` with Pietric, build it both unoptimized and with `opt -O2`, run it and compare its output with the expected output. From the build directory, run:
+The end-to-end tests compile each program in `tests/cases/` with Pietric at `-O0` and at `-O2`, run it and compare its output with the expected output. From the build directory, run:
 ```bash
 ctest --output-on-failure
 ```
 or call the script directly to see each failure (an optional last argument selects tests whose name contains it):
 ```bash
-../tests/run_tests.sh ./Pietric "$(which llc)" "$(which opt)" cc ../tests/cases
+../tests/run_tests.sh ./Pietric cc ../tests/cases
 ```
 
 A test case `<name>` consists of the program (`<name>.txt` or an image), the expected stdout (`<name>.out`) and optionally stdin (`<name>.in`). The text-format cases are generated by `tests/gen_cases.py`; to add one, add an entry to `CASES` with its expected output and run `python3 tests/gen_cases.py`.
