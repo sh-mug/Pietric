@@ -16,15 +16,19 @@ Pietric/
 │   ├── Graph.h  
 │   ├── IRBuilder.h  
 │   └── StackVM.h  
-└── src/
-    ├── main.cpp        # Main driver for the compiler
-    ├── Utils.cpp       # Utility functions (e.g., hex string conversion)
-    ├── Parser.cpp      # Parses input files (text files with hex codes or BMP/PNG/GIF images)
-    ├── ImageLoader.cpp # Loads images using the stb_image library
-    ├── Graph.cpp       # Builds the execution graph according to Piet’s DP and CC rules
-    ├── IRBuilder.cpp   # Generates LLVM IR from the execution graph.  
-    │                   # (Includes code for pointer, switch, and I/O commands.)
-    └── StackVM.cpp     # Implements the runtime “StackVM” library with fast, variable-length stack operations
+├── src/
+│   ├── main.cpp        # Main driver for the compiler
+│   ├── Utils.cpp       # Utility functions (e.g., hex string conversion)
+│   ├── Parser.cpp      # Parses input files (text files with hex codes or BMP/PNG/GIF images)
+│   ├── ImageLoader.cpp # Loads images using the stb_image library
+│   ├── Graph.cpp       # Builds the execution graph according to Piet’s DP and CC rules
+│   ├── IRBuilder.cpp   # Generates LLVM IR from the execution graph.  
+│   │                   # (Includes code for pointer, switch, and I/O commands.)
+│   └── StackVM.cpp     # Runtime library (stack operations and I/O) linked into compiled programs
+└── tests/
+    ├── run_tests.sh    # Compiles, runs and checks every program in cases/
+    ├── gen_cases.py    # Generates the text-format test programs in cases/
+    └── cases/          # Test programs with their expected output (and input)
 ```
 
 ## Building the Compiler
@@ -46,6 +50,7 @@ This project uses CMake as its build system. To build the compiler:
    ```bash
    cmake ..
    ```
+   (or `cmake .. -DLLVM_DIR=/path/to/lib/cmake/llvm`)
 
 3. **Build the Project**  
    Compile the source files:
@@ -53,7 +58,7 @@ This project uses CMake as its build system. To build the compiler:
    make
    ```
 
-An executable named `Pietric` will be produced in the build directory.
+This produces the compiler `Pietric` and the runtime library `libPietRuntime.a` in the build directory.
 
 ## Using the Compiler
 
@@ -72,25 +77,17 @@ This parses your Piet program and outputs `output.ll` (the LLVM IR file) in the 
 You can use LLVM’s tools and your system compiler to convert the IR into a runnable executable. For example:
 
 1. **Compile to Object File**  
-   Use `llc` to compile the LLVM IR to an object file (ensuring opaque pointers are enabled):
+   Use `llc` to compile the LLVM IR to an object file:
    ```bash
-   llc output.ll -opaque-pointers -filetype=obj -o output.o
+   llc output.ll -relocation-model=pic -filetype=obj -o output.o
    ```
+   (`-relocation-model=pic` is needed when your linker produces position-independent executables, the default on most Linux distributions.)
 
-2. **Generate StackVM.o**
-    The runtime functions (e.g., in StackVM.cpp) must be compiled into an object file. From the root directory, run:
-    ```bash
-    g++ -c ../src/StackVM.cpp -I ../include -o StackVM.o
-    ```
-    (You may also need to compile additional runtime source files if you have split your runtime across multiple files.)
-
-3. **Link with the Runtime Library**  
-   Compile the runtime (e.g., `StackVM.cpp`, along with any other needed runtime source files) and link everything together using a C++ compiler (e.g., g++ or clang++):
+2. **Link with the Runtime Library**  
+   Link the object file with the runtime library built alongside the compiler, using a C++ compiler (e.g., g++ or clang++):
    ```bash
-   # For example, if you already built StackVM.o from StackVM.cpp:
-   g++ output.o StackVM.o -o output
+   g++ output.o libPietRuntime.a -o output
    ```
-   Make sure to include object files for any additional runtime functions (like `pointerOp`, `switchOp`, `inputNum`, etc.).
 
 ### Step 3: Run the Executable
 
@@ -103,11 +100,38 @@ Once linked, run your executable:
 
 To optimize the generated LLVM IR, you can run LLVM’s optimization passes. For example, using the `opt` tool:
 ```bash
-opt -O3 output.ll -opaque-pointers -S -o optimized.ll
-llc optimized.ll -opaque-pointers -filetype=obj -o output.o
-g++ output.o StackVM.o -o output
+opt -O3 output.ll -S -o optimized.ll
+llc optimized.ll -relocation-model=pic -filetype=obj -o output.o
+g++ output.o libPietRuntime.a -o output
 ```
 You can also integrate LLVM’s pass manager into your IR generation pipeline if desired.
+
+## Semantics
+
+Pietric follows the [Piet specification](https://www.dangermouse.net/esoteric/piet.html). Where the specification leaves a choice, Pietric behaves as follows:
+
+- Values are 32-bit signed integers; arithmetic wraps around on overflow.
+- A command that needs more values than the stack holds is ignored, as the specification prescribes for operations that cannot be performed.
+- `divide` truncates towards zero. `mod` gives a result with the sign of the divisor (the top value). Division or modulo by zero is ignored and leaves both operands on the stack, as the specification recommends.
+- `roll` with a negative depth, or a depth greater than the number of remaining values, is ignored and leaves its two arguments on the stack.
+- `pointer` turns the DP clockwise by the popped value modulo 4 (anticlockwise for negative values); `switch` toggles the CC the absolute value of the popped value times.
+- `in(number)` skips whitespace and reads an optionally signed decimal integer; `in(char)` reads one byte. If nothing can be read (end of input, or no number at the current position), nothing is pushed. `out(char)` writes the low byte of the value.
+- Sliding through white codels follows the 2008 clarification of the specification: the program terminates when it would retrace its route within a white region.
+- The program starts at the top-left codel; if it is black or white, the compiled program does nothing.
+- All colors other than the 20 Piet colors are treated as one extra color: its codels form blocks like any other color, but moving into or out of them never executes a command.
+
+## Testing
+
+The end-to-end tests compile each program in `tests/cases/` with Pietric, link it against the runtime both unoptimized and with `opt -O2`, run it and compare its output with the expected output. From the build directory, run:
+```bash
+ctest --output-on-failure
+```
+or call the script directly to see each failure (an optional last argument selects tests whose name contains it):
+```bash
+../tests/run_tests.sh ./Pietric "$(which llc)" "$(which opt)" c++ ./libPietRuntime.a ../tests/cases
+```
+
+A test case `<name>` consists of the program (`<name>.txt` or an image), the expected stdout (`<name>.out`) and optionally stdin (`<name>.in`). The text-format cases are generated by `tests/gen_cases.py`; to add one, add an entry to `CASES` with its expected output and run `python3 tests/gen_cases.py`.
 
 ## License
 
