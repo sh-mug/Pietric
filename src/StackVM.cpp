@@ -30,6 +30,12 @@ int stackPop(Stack* stack) {
     return value;
 }
 
+// Return the number of values on the stack.
+int stackSize(Stack* stack) {
+    if (!stack) return 0;
+    return static_cast<int>(stack->data.size());
+}
+
 // Roll the top 'depth' values upward by 'rolls' positions.
 // This rotates the top 'depth' items in the stack. If depth is invalid, do nothing.
 void stackRoll(Stack* stack, int rolls, int depth) {

@@ -25,15 +25,23 @@ private:
     Value *inputSlot = nullptr;  // receives values read by the input commands
 
     // Runtime library functions.
-    FunctionCallee stackPushF, stackPopF, createStackF, destroyStackF, stackRollF;
+    FunctionCallee stackPushF, stackPopF, stackSizeF, createStackF, destroyStackF, stackRollF;
     FunctionCallee readNumberF, readCharF, writeNumberF, writeCharF;
 
     ConstantInt *constant(int value) { return ConstantInt::get(i32, value); }
     Value *pop() { return builder.CreateCall(stackPopF, { stack }); }
     void push(Value *value) { builder.CreateCall(stackPushF, { stack, value }); }
+    Value *stackSize() { return builder.CreateCall(stackSizeF, { stack }); }
 
     // Emits `if (cond) { then(); }` and continues after it.
     template <typename F> void emitIf(Value *cond, F then);
+    // Emits `if (cond) { then(); } else { otherwise(); }` and continues after it.
+    template <typename T, typename E> void emitIfElse(Value *cond, T then, E otherwise);
+    // Emits `then` guarded by a check that the stack holds at least `count` values.
+    // A command that needs more values than the stack holds is ignored.
+    template <typename F> void emitIfStackHas(int count, F then);
+    // Emits a command that pops two values and pushes op(second, top).
+    template <typename F> void emitBinary(F op);
     // Emits an input command: calls `readF` and pushes the value if one was read.
     void emitInput(FunctionCallee readF);
 
@@ -52,6 +60,8 @@ CodeGen::CodeGen(LLVMContext &ctx, Module &module)
         "stackPush", FunctionType::get(voidTy, { stackPtrTy, i32 }, false));
     stackPopF = module.getOrInsertFunction(
         "stackPop", FunctionType::get(i32, { stackPtrTy }, false));
+    stackSizeF = module.getOrInsertFunction(
+        "stackSize", FunctionType::get(i32, { stackPtrTy }, false));
     createStackF = module.getOrInsertFunction(
         "createStack", FunctionType::get(stackPtrTy, {}, false));
     destroyStackF = module.getOrInsertFunction(
@@ -79,6 +89,32 @@ template <typename F> void CodeGen::emitIf(Value *cond, F then) {
     builder.SetInsertPoint(contBB);
 }
 
+template <typename T, typename E> void CodeGen::emitIfElse(Value *cond, T then, E otherwise) {
+    BasicBlock *thenBB = BasicBlock::Create(ctx, "then", mainFunc);
+    BasicBlock *elseBB = BasicBlock::Create(ctx, "else", mainFunc);
+    BasicBlock *contBB = BasicBlock::Create(ctx, "cont", mainFunc);
+    builder.CreateCondBr(cond, thenBB, elseBB);
+    builder.SetInsertPoint(thenBB);
+    then();
+    builder.CreateBr(contBB);
+    builder.SetInsertPoint(elseBB);
+    otherwise();
+    builder.CreateBr(contBB);
+    builder.SetInsertPoint(contBB);
+}
+
+template <typename F> void CodeGen::emitIfStackHas(int count, F then) {
+    emitIf(builder.CreateICmpSGE(stackSize(), constant(count)), then);
+}
+
+template <typename F> void CodeGen::emitBinary(F op) {
+    emitIfStackHas(2, [&] {
+        Value *top = pop();
+        Value *second = pop();
+        push(op(second, top));
+    });
+}
+
 void CodeGen::emitInput(FunctionCallee readF) {
     // If nothing can be read (e.g. at end of input), the command is ignored.
     Value *ok = builder.CreateCall(readF, { inputSlot });
@@ -93,63 +129,57 @@ void CodeGen::emitCommand(Command cmd, int blockSize) {
             push(constant(blockSize));
             break;
         case Command::Pop:
-            pop();
+            emitIfStackHas(1, [&] { pop(); });
             break;
-        case Command::Add: {
-            Value *a = pop();
-            Value *b = pop();
-            push(builder.CreateAdd(a, b));
+        case Command::Add:
+            emitBinary([&](Value *a, Value *b) { return builder.CreateAdd(a, b); });
             break;
-        }
-        case Command::Subtract: {
-            Value *a = pop();
-            Value *b = pop();
-            push(builder.CreateSub(b, a));
+        case Command::Subtract:
+            emitBinary([&](Value *a, Value *b) { return builder.CreateSub(a, b); });
             break;
-        }
-        case Command::Multiply: {
-            Value *a = pop();
-            Value *b = pop();
-            push(builder.CreateMul(a, b));
+        case Command::Multiply:
+            emitBinary([&](Value *a, Value *b) { return builder.CreateMul(a, b); });
             break;
-        }
-        case Command::Divide: {
-            Value *a = pop();
-            Value *b = pop();
-            push(builder.CreateSDiv(b, a));
+        case Command::Divide:
+            emitBinary([&](Value *a, Value *b) { return builder.CreateSDiv(a, b); });
             break;
-        }
-        case Command::Modulo: {
-            Value *a = pop();
-            Value *b = pop();
-            push(builder.CreateSRem(b, a));
+        case Command::Modulo:
+            emitBinary([&](Value *a, Value *b) { return builder.CreateSRem(a, b); });
             break;
-        }
-        case Command::Not: {
-            Value *a = pop();
-            Value *isZero = builder.CreateICmpEQ(a, constant(0));
-            push(builder.CreateSelect(isZero, constant(1), constant(0)));
+        case Command::Not:
+            emitIfStackHas(1, [&] {
+                Value *isZero = builder.CreateICmpEQ(pop(), constant(0));
+                push(builder.CreateZExt(isZero, i32));
+            });
             break;
-        }
-        case Command::Greater: {
-            Value *a = pop();
-            Value *b = pop();
-            Value *greater = builder.CreateICmpSGT(b, a);
-            push(builder.CreateSelect(greater, constant(1), constant(0)));
+        case Command::Greater:
+            emitBinary([&](Value *a, Value *b) {
+                return builder.CreateZExt(builder.CreateICmpSGT(a, b), i32);
+            });
             break;
-        }
-        case Command::Duplicate: {
-            Value *top = pop();
-            push(top);
-            push(top);
+        case Command::Duplicate:
+            emitIfStackHas(1, [&] {
+                Value *top = pop();
+                push(top);
+                push(top);
+            });
             break;
-        }
-        case Command::Roll: {
-            Value *rolls = pop();
-            Value *depth = pop();
-            builder.CreateCall(stackRollF, { stack, rolls, depth });
+        case Command::Roll:
+            emitIfStackHas(2, [&] {
+                Value *rolls = pop();
+                Value *depth = pop();
+                // A negative depth, or one greater than the number of remaining values, cannot
+                // be rolled: the command is ignored, so the arguments go back on the stack.
+                Value *valid = builder.CreateAnd(builder.CreateICmpSGE(depth, constant(0)),
+                                                 builder.CreateICmpSLE(depth, stackSize()));
+                emitIfElse(valid,
+                           [&] { builder.CreateCall(stackRollF, { stack, rolls, depth }); },
+                           [&] {
+                               push(depth);
+                               push(rolls);
+                           });
+            });
             break;
-        }
         case Command::InputNum:
             emitInput(readNumberF);
             break;
@@ -157,10 +187,10 @@ void CodeGen::emitCommand(Command cmd, int blockSize) {
             emitInput(readCharF);
             break;
         case Command::OutputNum:
-            builder.CreateCall(writeNumberF, { pop() });
+            emitIfStackHas(1, [&] { builder.CreateCall(writeNumberF, { pop() }); });
             break;
         case Command::OutputChar:
-            builder.CreateCall(writeCharF, { pop() });
+            emitIfStackHas(1, [&] { builder.CreateCall(writeCharF, { pop() }); });
             break;
         case Command::None:
         case Command::Pointer:

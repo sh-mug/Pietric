@@ -25,8 +25,12 @@ void stackPush(Stack* stack, int value);
 // If the stack is empty, returns 0.
 int stackPop(Stack* stack);
 
+// Return the number of values on the stack.
+int stackSize(Stack* stack);
+
 // Roll the top 'depth' values on the stack upward by 'rolls' positions.
 // (If rolls is negative, rotate in the opposite direction.)
+// Does nothing unless 0 < depth <= stackSize(stack).
 void stackRoll(Stack* stack, int rolls, int depth);
 
 // Read an integer from stdin: optional whitespace, an optional sign and at

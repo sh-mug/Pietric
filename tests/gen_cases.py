@@ -243,6 +243,35 @@ CASES = [
      ["inn", "inn", "add", "outn", "inn", "outn",
       "push 2", "inn", "outn", "inc", "outc", "push 3", "inc", "outn"],
      b"772x3", b"12 -5\n+7 x"),
+
+    # Commands that need more values than the stack holds are ignored.
+    ("underflow_unary", linear,
+     ["dup", "not", "pop", "outn", "outc", "push 2", "outn"], b"2", None),
+    ("underflow_binary", linear,
+     ["push 3", "add", "outn", "push 3", "sub", "outn", "push 3", "mul", "outn",
+      "push 3", "div", "outn", "push 3", "mod", "outn", "push 3", "gt", "outn"],
+     b"333333", None),
+    ("underflow_roll", linear, ["push 2", "roll", "outn"], b"2", None),
+
+    # roll
+    ("roll_basic", linear,
+     ["push 1", "push 2", "push 3", "push 3", "push 1", "roll", "outn", "outn", "outn"],
+     b"213", None),
+    ("roll_negative", linear,
+     ["push 1", "push 2", "push 3", "push 3"] + neg(1) + ["roll", "outn", "outn", "outn"],
+     b"132", None),
+    ("roll_many", linear,
+     ["push 1", "push 2", "push 3", "push 3", "push 7", "roll", "outn", "outn", "outn"],
+     b"213", None),
+    ("roll_zero_depth", linear,
+     ["push 5"] + zero() + ["push 2", "roll", "outn", "outn"], b"5", None),
+    # A depth greater than the rest of the stack or a negative depth is an
+    # error: the command is ignored and the arguments stay on the stack.
+    ("roll_too_deep", linear,
+     ["push 1", "push 2", "push 5", "push 1", "roll", "outn", "outn", "outn", "outn"],
+     b"1521", None),
+    ("roll_negative_depth", linear,
+     ["push 7"] + neg(1) + ["push 1", "roll", "outn", "outn", "outn"], b"1-17", None),
 ]
 
 
