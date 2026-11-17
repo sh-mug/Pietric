@@ -1,6 +1,6 @@
 # Pietric
 
-Pietric is a C++-centric compiler for the Piet programming language. Piet is an esoteric, stack-based language where programs are painted as abstract images. This compiler uses LLVM IR as its intermediate representation and then generates machine code with a custom runtime library implementing the Piet stack operations.
+Pietric is a C++-centric compiler for the Piet programming language. Piet is an esoteric, stack-based language where programs are painted as abstract images. This compiler uses LLVM IR as its intermediate representation and then generates machine code. The Piet stack is implemented directly in the generated IR, so LLVM's optimizer can see through every stack operation; only I/O comes from a small runtime library.
 
 ## File Structure
 
@@ -15,6 +15,7 @@ Pietric/
 │   ├── Parser.h    
 │   ├── Graph.h  
 │   ├── IRBuilder.h  
+│   ├── Runtime.h  
 │   └── StackVM.h  
 ├── src/
 │   ├── main.cpp        # Main driver for the compiler
@@ -22,9 +23,9 @@ Pietric/
 │   ├── Parser.cpp      # Parses input files (text files with hex codes or BMP/PNG/GIF images)
 │   ├── ImageLoader.cpp # Loads images using the stb_image library
 │   ├── Graph.cpp       # Builds the execution graph according to Piet’s DP and CC rules
-│   ├── IRBuilder.cpp   # Generates LLVM IR from the execution graph.  
-│   │                   # (Includes code for pointer, switch, and I/O commands.)
-│   └── StackVM.cpp     # Runtime library (stack operations and I/O) linked into compiled programs
+│   ├── IRBuilder.cpp   # Generates LLVM IR from the execution graph, with the stack operations inline
+│   ├── Runtime.cpp     # Support functions emitted into the generated module (stack growth, roll)
+│   └── StackVM.cpp     # Runtime library (I/O) linked into compiled programs
 └── tests/
     ├── run_tests.sh    # Compiles, runs and checks every program in cases/
     ├── gen_cases.py    # Generates the text-format test programs in cases/
@@ -111,6 +112,7 @@ You can also integrate LLVM’s pass manager into your IR generation pipeline if
 Pietric follows the [Piet specification](https://www.dangermouse.net/esoteric/piet.html). Where the specification leaves a choice, Pietric behaves as follows:
 
 - Values are 32-bit signed integers; arithmetic wraps around on overflow.
+- The stack grows as needed. If memory runs out, the program reports it on stderr and exits with status 1.
 - A command that needs more values than the stack holds is ignored, as the specification prescribes for operations that cannot be performed.
 - `divide` truncates towards zero. `mod` gives a result with the sign of the divisor (the top value). Division or modulo by zero is ignored and leaves both operands on the stack, as the specification recommends.
 - `roll` with a negative depth, or a depth greater than the number of remaining values, is ignored and leaves its two arguments on the stack.

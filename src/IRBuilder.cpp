@@ -1,4 +1,5 @@
 #include "IRBuilder.h"
+#include "Runtime.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
@@ -8,9 +9,19 @@ using namespace llvm;
 
 namespace {
 
+// Number of values the stack has room for before it first has to grow.
+constexpr int64_t kInitialStackCapacity = 1024;
+
 // Emits main() for an execution graph. Every graph node becomes a basic block
 // that performs the command of its outgoing edge and branches to the
-// successor node; the stack lives in the runtime library (StackVM.cpp).
+// successor node.
+//
+// The stack is a heap buffer of i32 values that doubles in size when it is
+// full. Its size, capacity and buffer pointer are kept in allocas of main()
+// and every push and pop is emitted inline, so once mem2reg has promoted
+// them, the optimizer sees plain loads and stores: the stack depth becomes a
+// constant wherever the control flow allows, and values can be forwarded from
+// the push that stores them to the pop that loads them.
 class CodeGen {
 public:
     CodeGen(LLVMContext &ctx, Module &module);
@@ -20,19 +31,30 @@ private:
     LLVMContext &ctx;
     Module &module;
     IRBuilder<> builder;
-    IntegerType *i32;
+    IntegerType *i32, *i64;
+    PointerType *ptr;
+    Runtime runtime;
     Function *mainFunc = nullptr;
-    Value *stack = nullptr;
     Value *inputSlot = nullptr;  // receives values read by the input commands
 
+    // The stack: buffer[0..size) holds its values, buffer[size - 1] being the top.
+    AllocaInst *sizeSlot = nullptr;      // i64
+    AllocaInst *capacitySlot = nullptr;  // i64: how many values the buffer has room for
+    AllocaInst *bufferSlot = nullptr;    // ptr
+
     // Runtime library functions.
-    FunctionCallee stackPushF, stackPopF, stackSizeF, createStackF, destroyStackF, stackRollF;
     FunctionCallee readNumberF, readCharF, writeNumberF, writeCharF;
 
     ConstantInt *constant(int value) { return ConstantInt::get(i32, value); }
-    Value *pop() { return builder.CreateCall(stackPopF, { stack }); }
-    void push(Value *value) { builder.CreateCall(stackPushF, { stack, value }); }
-    Value *stackSize() { return builder.CreateCall(stackSizeF, { stack }); }
+    ConstantInt *index(int64_t value) { return ConstantInt::get(i64, value); }
+    Value *stackSize() { return builder.CreateLoad(i64, sizeSlot, "size"); }
+    Value *stackBuffer() { return builder.CreateLoad(ptr, bufferSlot, "buffer"); }
+    // Pops the top value. The stack must not be empty.
+    Value *pop();
+    void push(Value *value);
+
+    // Allocates the stack at the start of main().
+    void emitStackInit();
 
     // Emits `if (cond) { then(); }` and continues after it.
     template <typename F> void emitIf(Value *cond, F then);
@@ -55,27 +77,13 @@ private:
 };
 
 CodeGen::CodeGen(LLVMContext &ctx, Module &module)
-    : ctx(ctx), module(module), builder(ctx), i32(Type::getInt32Ty(ctx)) {
+    : ctx(ctx), module(module), builder(ctx), i32(builder.getInt32Ty()),
+      i64(builder.getInt64Ty()), ptr(builder.getPtrTy()), runtime(defineRuntime(module)) {
     Type *voidTy = Type::getVoidTy(ctx);
-    PointerType *stackPtrTy = PointerType::getUnqual(Type::getInt8Ty(ctx));
-
-    stackPushF = module.getOrInsertFunction(
-        "stackPush", FunctionType::get(voidTy, { stackPtrTy, i32 }, false));
-    stackPopF = module.getOrInsertFunction(
-        "stackPop", FunctionType::get(i32, { stackPtrTy }, false));
-    stackSizeF = module.getOrInsertFunction(
-        "stackSize", FunctionType::get(i32, { stackPtrTy }, false));
-    createStackF = module.getOrInsertFunction(
-        "createStack", FunctionType::get(stackPtrTy, {}, false));
-    destroyStackF = module.getOrInsertFunction(
-        "destroyStack", FunctionType::get(voidTy, { stackPtrTy }, false));
-    stackRollF = module.getOrInsertFunction(
-        "stackRoll", FunctionType::get(voidTy, { stackPtrTy, i32, i32 }, false));
-    PointerType *intPtrTy = PointerType::getUnqual(i32);
     readNumberF = module.getOrInsertFunction(
-        "pietReadNumber", FunctionType::get(i32, { intPtrTy }, false));
+        "pietReadNumber", FunctionType::get(i32, { ptr }, false));
     readCharF = module.getOrInsertFunction(
-        "pietReadChar", FunctionType::get(i32, { intPtrTy }, false));
+        "pietReadChar", FunctionType::get(i32, { ptr }, false));
     writeNumberF = module.getOrInsertFunction(
         "pietWriteNumber", FunctionType::get(voidTy, { i32 }, false));
     writeCharF = module.getOrInsertFunction(
@@ -106,8 +114,40 @@ template <typename T, typename E> void CodeGen::emitIfElse(Value *cond, T then, 
     builder.SetInsertPoint(contBB);
 }
 
+Value *CodeGen::pop() {
+    // The callers check the size first, so it cannot wrap.
+    Value *newSize = builder.CreateNUWSub(stackSize(), index(1));
+    builder.CreateStore(newSize, sizeSlot);
+    return builder.CreateLoad(i32, builder.CreateInBoundsGEP(i32, stackBuffer(), newSize));
+}
+
+void CodeGen::push(Value *value) {
+    Value *size = stackSize();
+    Value *capacity = builder.CreateLoad(i64, capacitySlot, "capacity");
+    emitIf(builder.CreateICmpEQ(size, capacity), [&] {
+        Value *newCapacity = builder.CreateNUWMul(capacity, index(2));
+        builder.CreateStore(builder.CreateCall(runtime.grow, { stackBuffer(), newCapacity }),
+                            bufferSlot);
+        builder.CreateStore(newCapacity, capacitySlot);
+    });
+    builder.CreateStore(value, builder.CreateInBoundsGEP(i32, stackBuffer(), size));
+    builder.CreateStore(builder.CreateNUWAdd(size, index(1)), sizeSlot);
+}
+
+void CodeGen::emitStackInit() {
+    sizeSlot = builder.CreateAlloca(i64, nullptr, "size.slot");
+    capacitySlot = builder.CreateAlloca(i64, nullptr, "capacity.slot");
+    bufferSlot = builder.CreateAlloca(ptr, nullptr, "buffer.slot");
+    builder.CreateStore(index(0), sizeSlot);
+    builder.CreateStore(index(kInitialStackCapacity), capacitySlot);
+    Value *buffer = builder.CreateCall(
+        runtime.malloc, { index(kInitialStackCapacity * sizeof(int32_t)) }, "buffer");
+    emitIf(builder.CreateIsNull(buffer), [&] { builder.CreateCall(runtime.outOfMemory); });
+    builder.CreateStore(buffer, bufferSlot);
+}
+
 template <typename F> void CodeGen::emitIfStackHas(int count, F then) {
-    emitIf(builder.CreateICmpSGE(stackSize(), constant(count)), then);
+    emitIf(builder.CreateICmpSGE(stackSize(), index(count)), then);
 }
 
 template <typename F> void CodeGen::emitBinary(F op) {
@@ -205,10 +245,16 @@ void CodeGen::emitCommand(Command cmd, int blockSize) {
                 Value *depth = pop();
                 // A negative depth, or one greater than the number of remaining values, cannot
                 // be rolled: the command is ignored, so the arguments go back on the stack.
+                Value *size = stackSize();
+                Value *wideDepth = builder.CreateSExt(depth, i64);
                 Value *valid = builder.CreateAnd(builder.CreateICmpSGE(depth, constant(0)),
-                                                 builder.CreateICmpSLE(depth, stackSize()));
+                                                 builder.CreateICmpSLE(wideDepth, size));
                 emitIfElse(valid,
-                           [&] { builder.CreateCall(stackRollF, { stack, rolls, depth }); },
+                           [&] {
+                               Value *base = builder.CreateInBoundsGEP(
+                                   i32, stackBuffer(), builder.CreateSub(size, wideDepth));
+                               builder.CreateCall(runtime.roll, { base, depth, rolls });
+                           },
                            [&] {
                                push(depth);
                                push(rolls);
@@ -246,7 +292,7 @@ void CodeGen::emitBranch(const GraphNode &node, const std::vector<BasicBlock *> 
 
     // With an empty stack the command is ignored and DP and CC stay as they are.
     BasicBlock *selectBB = BasicBlock::Create(ctx, "select", mainFunc);
-    builder.CreateCondBr(builder.CreateICmpSGT(stackSize(), constant(0)), selectBB, unchangedBB);
+    builder.CreateCondBr(builder.CreateICmpSGT(stackSize(), index(0)), selectBB, unchangedBB);
     builder.SetInsertPoint(selectBB);
 
     Value *value = pop();
@@ -275,16 +321,14 @@ void CodeGen::emit(const Graph &graph) {
     BasicBlock *entryBB = BasicBlock::Create(ctx, "entry", mainFunc);
     builder.SetInsertPoint(entryBB);
 
-    inputSlot = builder.CreateAlloca(i32, nullptr, "input");
-
-    // Create the runtime stack.
-    stack = builder.CreateCall(createStackF, {});
-
     const std::vector<GraphNode> &nodes = graph.getNodes();
     if (nodes.empty()) {
         builder.CreateRet(constant(0));
         return;
     }
+
+    inputSlot = builder.CreateAlloca(i32, nullptr, "input");
+    emitStackInit();
 
     // Create a basic block for each graph node.
     std::vector<BasicBlock *> bbNodes;
@@ -299,8 +343,8 @@ void CodeGen::emit(const Graph &graph) {
         const GraphNode &node = nodes[i];
 
         if (node.transitions.empty()) {
-            // Terminal state: destroy stack and return.
-            builder.CreateCall(destroyStackF, { stack });
+            // Terminal state: free the stack and return.
+            builder.CreateCall(runtime.free, { stackBuffer() });
             builder.CreateRet(constant(0));
         } else if (node.transitions[0].command == Command::Pointer ||
                    node.transitions[0].command == Command::Switch) {

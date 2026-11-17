@@ -38,6 +38,7 @@ set(SOURCES
     src/Parser.cpp
     src/Graph.cpp
     src/IRBuilder.cpp
+    src/Runtime.cpp
     src/ImageLoader.cpp
 )
 
@@ -47,7 +48,7 @@ llvm_map_components_to_libnames(llvm_libs support core irreader native)
 
 target_link_libraries(Pietric ${llvm_libs})
 
-# Runtime library that compiled Piet programs are linked against.
+# I/O library that compiled Piet programs are linked against.
 add_library(PietRuntime STATIC src/StackVM.cpp)
 
 # End-to-end tests (run with `ctest` from the build directory).
