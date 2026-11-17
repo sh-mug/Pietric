@@ -315,9 +315,10 @@ void Graph::buildGraph(const std::vector<std::vector<PietColor>> &grid) {
                     trialCC = toggleCC(trialCC);
                     trialDP = rotateDP(trialDP, 1);
         
-                    // Check if we have begun retracing our route: if we have returned to the
-                    // initial white sliding state (same candidate, DP, and CC), then there is no way out.
-                    if (visitedWhite.find({candidate, trialDP, trialCC}) != visitedWhite.end()) {
+                    // Check if we have begun retracing our route: the next slide would start
+                    // from the last white codel with the new DP and CC. If that slide has been
+                    // made before, we are in a cycle and there is no way out.
+                    if (visitedWhite.find({lastWhite, trialDP, trialCC}) != visitedWhite.end()) {
                         foundExit = false;
                         break; // No exit possible; break out of white-sliding loop.
                     }

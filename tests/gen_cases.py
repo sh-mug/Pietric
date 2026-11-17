@@ -122,6 +122,44 @@ def switch_split(program):
     return [row0, row1, row2, row3]
 
 
+def white_trap(program):
+    """After the last command the program slides into a white region it can
+    never leave, which terminates it:
+
+        prefix  B  W  W
+        K...K   K  K  W
+    """
+    cells, b = lay_out_row(program)
+    k = len(cells)
+    row0 = cells + [hexof(b), WHITE, WHITE]
+    row1 = [BLACK] * (k + 2) + [WHITE]
+    return [row0, row1]
+
+
+def white_turn(program):
+    """After the last command the program slides from B through white, turns
+    twice at the edges and enters S without executing a command. S -> T is
+    out(char); T then slides into a white region with no way out:
+
+        prefix      B  W
+        K...K K  K  K  W
+        K...K W  K  K  W
+        K...K W  T  S  W
+
+    The colour of S is chosen so that executing B -> S would change the
+    output (it would be an add)."""
+    cells, b = lay_out_row(program)
+    k = len(cells)
+    assert k >= 2
+    s = step(b, "add")
+    t = step(s, "outc")
+    row0 = cells + [hexof(b), WHITE]
+    row1 = [BLACK] * (k + 1) + [WHITE]
+    row2 = [BLACK] * (k - 2) + [WHITE, BLACK, BLACK, WHITE]
+    row3 = [BLACK] * (k - 2) + [WHITE, hexof(t), hexof(s), WHITE]
+    return [row0, row1, row2, row3]
+
+
 # Pushes 65 ('A') using only small blocks.
 PUSH_65 = ["push 8", "dup", "mul", "push 1", "add"]
 SPACE = ["push 32", "outc"]
@@ -142,6 +180,10 @@ CASES = [
      ["push 8", "dup", "mul", "push 1", "add", "dup", "outc",
       "push 1", "add", "outc"],
      b"AB", None),
+
+    # White regions that cannot be left terminate the program.
+    ("white_trap", white_trap, PUSH_65 + ["outc"], b"A", None),
+    ("white_turn", white_turn, PUSH_65 + ["dup"], b"A", None),
 ]
 
 
