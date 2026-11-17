@@ -48,7 +48,6 @@ private:
     PointerType *ptr;
     Runtime runtime;
     Function *mainFunc = nullptr;
-    Value *inputSlot = nullptr;  // receives values read by the input commands
 
     // Depth-tracked stack: slots[i] holds the value at position i (0 is the bottom).
     std::vector<AllocaInst *> slots;
@@ -64,9 +63,6 @@ private:
     std::map<std::pair<int, int>, BasicBlock *> copies;
     std::deque<std::pair<int, int>> pending;
     size_t trackedCopies = 0;
-
-    // Runtime library functions.
-    FunctionCallee readNumberF, readCharF, writeNumberF, writeCharF;
 
     ConstantInt *constant(int value) { return ConstantInt::get(i32, value); }
     ConstantInt *index(int64_t value) { return ConstantInt::get(i64, value); }
@@ -106,7 +102,8 @@ private:
     void emitRoll(int next);
     // Rolls the top `rollDepth` values (0 <= rollDepth <= depth) of the depth-tracked stack.
     void emitTrackedRoll(Value *rollDepth, Value *rolls);
-    void emitInput(FunctionCallee readF, int next);
+    // Emits an input command: calls `readF` and pushes the value if one was read.
+    void emitInput(Function *readF, int next);
     // Emits a pointer or switch command, which picks the successor.
     void emitPointerSwitch(const GraphNode &node);
     void emitNode(const GraphNode &node);
@@ -114,17 +111,7 @@ private:
 
 CodeGen::CodeGen(LLVMContext &ctx, Module &module)
     : ctx(ctx), module(module), builder(ctx), i32(builder.getInt32Ty()),
-      i64(builder.getInt64Ty()), ptr(builder.getPtrTy()), runtime(defineRuntime(module)) {
-    Type *voidTy = Type::getVoidTy(ctx);
-    readNumberF = module.getOrInsertFunction(
-        "pietReadNumber", FunctionType::get(i32, { ptr }, false));
-    readCharF = module.getOrInsertFunction(
-        "pietReadChar", FunctionType::get(i32, { ptr }, false));
-    writeNumberF = module.getOrInsertFunction(
-        "pietWriteNumber", FunctionType::get(voidTy, { i32 }, false));
-    writeCharF = module.getOrInsertFunction(
-        "pietWriteChar", FunctionType::get(voidTy, { i32 }, false));
-}
+      i64(builder.getInt64Ty()), ptr(builder.getPtrTy()), runtime(defineRuntime(module)) { }
 
 BasicBlock *CodeGen::copyOf(int node, int copyDepth) {
     auto key = std::make_pair(node, copyDepth);
@@ -353,12 +340,12 @@ void CodeGen::emitTrackedRoll(Value *rollDepth, Value *rolls) {
         builder.CreateStore(rolled[i], slots[i]);
 }
 
-void CodeGen::emitInput(FunctionCallee readF, int next) {
+void CodeGen::emitInput(Function *readF, int next) {
     // If nothing can be read (e.g. at end of input), the command is ignored.
-    Value *ok = builder.CreateCall(readF, { inputSlot });
-    emitBranch(builder.CreateICmpNE(ok, constant(0)),
+    Value *result = builder.CreateCall(readF);
+    emitBranch(builder.CreateExtractValue(result, 0),
         [&] {
-            push(builder.CreateLoad(i32, inputSlot));
+            push(builder.CreateExtractValue(result, 1));
             jump(next);
         },
         [&] { jump(next); });
@@ -415,15 +402,15 @@ void CodeGen::emitCommand(Command cmd, int blockSize, int next) {
             emitRoll(next);
             break;
         case Command::InputNum:
-            emitInput(readNumberF, next);
+            emitInput(runtime.readNumber, next);
             break;
         case Command::InputChar:
-            emitInput(readCharF, next);
+            emitInput(runtime.readChar, next);
             break;
         case Command::OutputNum:
             emitIfStackHas(1,
                 [&] {
-                    builder.CreateCall(writeNumberF, { pop() });
+                    builder.CreateCall(runtime.writeNumber, { pop() });
                     jump(next);
                 },
                 proceed);
@@ -431,7 +418,8 @@ void CodeGen::emitCommand(Command cmd, int blockSize, int next) {
         case Command::OutputChar:
             emitIfStackHas(1,
                 [&] {
-                    builder.CreateCall(writeCharF, { pop() });
+                    // out(char) writes the low byte, as putchar does.
+                    builder.CreateCall(runtime.putchar, { pop() });
                     jump(next);
                 },
                 proceed);
@@ -516,7 +504,6 @@ void CodeGen::emit(const Graph &graph) {
         return;
     }
 
-    inputSlot = builder.CreateAlloca(i32, nullptr, "input");
     for (int i = 0; i < kMaxTrackedDepth; i++)
         slots.push_back(builder.CreateAlloca(i32, nullptr, "slot" + std::to_string(i)));
     sizeSlot = builder.CreateAlloca(i64, nullptr, "size.slot");

@@ -16,8 +16,19 @@ struct Runtime {
     // roll command does. Requires depth >= 0.
     llvm::Function *roll;
 
+    // { i1, i32 } (): reads an integer from stdin, as in(number) does: skips
+    // whitespace, then reads an optional sign and at least one digit
+    // (out-of-range values wrap around). Returns whether a number was read,
+    // and the number; the character that ended the attempt stays unread.
+    llvm::Function *readNumber;
+    // { i1, i32 } (): reads one byte from stdin. Returns false at end of input.
+    llvm::Function *readChar;
+    // void (i32): writes a value to stdout as a decimal number.
+    llvm::Function *writeNumber;
+
     llvm::FunctionCallee malloc;
     llvm::FunctionCallee free;
+    llvm::FunctionCallee putchar;
 };
 
 // Defines the runtime functions in `module`.

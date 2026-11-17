@@ -23,6 +23,18 @@ private:
     Function *defineGrow(Function *outOfMemory);
     Function *defineReverse();
     Function *defineRoll(Function *reverse);
+
+    // Input goes through piet.getc, which returns a character put back by
+    // piet.read_number before reading a new one.
+    GlobalVariable *lookahead = nullptr;
+    FunctionCallee fflushF;
+    Function *defineGetc();
+    Function *defineReadNumber(Function *getc);
+    Function *defineReadChar(Function *getc);
+    Function *defineWriteNumber();
+    // Flushes stdout before reading, so that a prompt is visible before the
+    // program waits for input.
+    void flushOutput();
 };
 
 RuntimeBuilder::RuntimeBuilder(Module &module)
@@ -154,6 +166,123 @@ Function *RuntimeBuilder::defineRoll(Function *reverse) {
     return f;
 }
 
+void RuntimeBuilder::flushOutput() {
+    builder.CreateCall(fflushF, { ConstantPointerNull::get(ptr) });  // fflush(NULL)
+}
+
+// i32 piet.getc()
+Function *RuntimeBuilder::defineGetc() {
+    FunctionCallee getcharF = module.getOrInsertFunction("getchar", FunctionType::get(i32, false));
+    // The character put back, or -1 (EOF) if there is none.
+    lookahead = new GlobalVariable(module, i32, false, GlobalValue::InternalLinkage,
+                                   builder.getInt32(-1), "piet.lookahead");
+
+    Function *f = define("piet.getc", FunctionType::get(i32, false));
+    BasicBlock *takeBB = BasicBlock::Create(ctx, "take", f);
+    BasicBlock *readBB = BasicBlock::Create(ctx, "read", f);
+    Value *c = builder.CreateLoad(i32, lookahead);
+    builder.CreateCondBr(builder.CreateICmpSGE(c, builder.getInt32(0)), takeBB, readBB);
+
+    builder.SetInsertPoint(takeBB);
+    builder.CreateStore(builder.getInt32(-1), lookahead);
+    builder.CreateRet(c);
+
+    builder.SetInsertPoint(readBB);
+    builder.CreateRet(builder.CreateCall(getcharF));
+    return f;
+}
+
+Function *RuntimeBuilder::defineReadNumber(Function *getc) {
+    StructType *resultTy = StructType::get(ctx, { builder.getInt1Ty(), i32 });
+    Function *f = define("piet.read_number", FunctionType::get(resultTy, false));
+    BasicBlock *skipBB = BasicBlock::Create(ctx, "skip", f);
+    BasicBlock *signBB = BasicBlock::Create(ctx, "sign", f);
+    BasicBlock *afterSignBB = BasicBlock::Create(ctx, "after_sign", f);
+    BasicBlock *firstBB = BasicBlock::Create(ctx, "first", f);
+    BasicBlock *failBB = BasicBlock::Create(ctx, "fail", f);
+    BasicBlock *digitsBB = BasicBlock::Create(ctx, "digits", f);
+    BasicBlock *doneBB = BasicBlock::Create(ctx, "done", f);
+    auto isDigit = [&](Value *c) {
+        return builder.CreateICmpULT(builder.CreateSub(c, builder.getInt32('0')),
+                                     builder.getInt32(10));
+    };
+    // Puts c back; at end of input c is -1, which leaves nothing to read back.
+    auto putBack = [&](Value *c) { builder.CreateStore(c, lookahead); };
+
+    flushOutput();
+    builder.CreateBr(skipBB);
+
+    // Skip whitespace (as isspace does in the C locale: space and \t \n \v \f \r).
+    builder.SetInsertPoint(skipBB);
+    Value *c = builder.CreateCall(getc);
+    Value *isSpace = builder.CreateOr(
+        builder.CreateICmpEQ(c, builder.getInt32(' ')),
+        builder.CreateICmpULT(builder.CreateSub(c, builder.getInt32('\t')), builder.getInt32(5)));
+    builder.CreateCondBr(isSpace, skipBB, signBB);
+
+    builder.SetInsertPoint(signBB);
+    Value *isMinus = builder.CreateICmpEQ(c, builder.getInt32('-'));
+    Value *isSign = builder.CreateOr(isMinus, builder.CreateICmpEQ(c, builder.getInt32('+')));
+    builder.CreateCondBr(isSign, afterSignBB, firstBB);
+
+    builder.SetInsertPoint(afterSignBB);
+    Value *afterSign = builder.CreateCall(getc);
+    builder.CreateBr(firstBB);
+
+    builder.SetInsertPoint(firstBB);
+    PHINode *first = builder.CreatePHI(i32, 2, "first");
+    first->addIncoming(c, signBB);
+    first->addIncoming(afterSign, afterSignBB);
+    PHINode *negative = builder.CreatePHI(builder.getInt1Ty(), 2, "negative");
+    negative->addIncoming(builder.getFalse(), signBB);
+    negative->addIncoming(isMinus, afterSignBB);
+    builder.CreateCondBr(isDigit(first), digitsBB, failBB);
+
+    builder.SetInsertPoint(failBB);
+    putBack(first);
+    builder.CreateRet(ConstantStruct::get(resultTy, { builder.getFalse(), builder.getInt32(0) }));
+
+    builder.SetInsertPoint(digitsBB);
+    PHINode *magnitude = builder.CreatePHI(i32, 2, "magnitude");
+    PHINode *digit = builder.CreatePHI(i32, 2, "digit");
+    Value *next = builder.CreateAdd(builder.CreateMul(magnitude, builder.getInt32(10)),
+                                    builder.CreateSub(digit, builder.getInt32('0')));
+    Value *following = builder.CreateCall(getc);
+    builder.CreateCondBr(isDigit(following), digitsBB, doneBB);
+    magnitude->addIncoming(builder.getInt32(0), firstBB);
+    magnitude->addIncoming(next, digitsBB);
+    digit->addIncoming(first, firstBB);
+    digit->addIncoming(following, digitsBB);
+
+    builder.SetInsertPoint(doneBB);
+    putBack(following);
+    Value *value = builder.CreateSelect(negative, builder.CreateNeg(next), next);
+    Value *result = builder.CreateInsertValue(PoisonValue::get(resultTy), builder.getTrue(), 0);
+    builder.CreateRet(builder.CreateInsertValue(result, value, 1));
+    return f;
+}
+
+Function *RuntimeBuilder::defineReadChar(Function *getc) {
+    StructType *resultTy = StructType::get(ctx, { builder.getInt1Ty(), i32 });
+    Function *f = define("piet.read_char", FunctionType::get(resultTy, false));
+    flushOutput();
+    Value *c = builder.CreateCall(getc);
+    Value *ok = builder.CreateICmpSGE(c, builder.getInt32(0));
+    Value *result = builder.CreateInsertValue(PoisonValue::get(resultTy), ok, 0);
+    builder.CreateRet(builder.CreateInsertValue(result, c, 1));
+    return f;
+}
+
+Function *RuntimeBuilder::defineWriteNumber() {
+    FunctionCallee printfF =
+        module.getOrInsertFunction("printf", FunctionType::get(i32, { ptr }, true));
+    Function *f = define("piet.write_number", FunctionType::get(voidTy, { i32 }, false));
+    Value *format = builder.CreateGlobalString("%d", "piet.int_format");
+    builder.CreateCall(printfF, { format, f->getArg(0) });
+    builder.CreateRetVoid();
+    return f;
+}
+
 Runtime RuntimeBuilder::build() {
     Runtime runtime;
     runtime.malloc = module.getOrInsertFunction("malloc", FunctionType::get(ptr, { i64 }, false));
@@ -161,6 +290,13 @@ Runtime RuntimeBuilder::build() {
     runtime.outOfMemory = defineOutOfMemory();
     runtime.grow = defineGrow(runtime.outOfMemory);
     runtime.roll = defineRoll(defineReverse());
+
+    runtime.putchar = module.getOrInsertFunction("putchar", FunctionType::get(i32, { i32 }, false));
+    fflushF = module.getOrInsertFunction("fflush", FunctionType::get(i32, { ptr }, false));
+    Function *getc = defineGetc();
+    runtime.readNumber = defineReadNumber(getc);
+    runtime.readChar = defineReadChar(getc);
+    runtime.writeNumber = defineWriteNumber();
     return runtime;
 }
 

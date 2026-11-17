@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end tests: compile every Piet program in a cases directory with
-# Pietric, link it against the runtime, run it and compare its stdout with
-# the expected output.
+# Pietric, link it with a C compiler, run it and compare its stdout with the
+# expected output.
 #
-# Usage: run_tests.sh <pietric> <llc> <opt> <cxx> <runtime-lib> <cases-dir> [name-filter]
+# Usage: run_tests.sh <pietric> <llc> <opt> <cc> <cases-dir> [name-filter]
 #
 # A test case <name> consists of
 #   <name>.txt|.png|.gif|.bmp  the Piet program
@@ -16,8 +16,8 @@
 
 set -u
 
-if [ $# -lt 6 ]; then
-    echo "usage: $0 <pietric> <llc> <opt> <cxx> <runtime-lib> <cases-dir> [name-filter]" >&2
+if [ $# -lt 5 ]; then
+    echo "usage: $0 <pietric> <llc> <opt> <cc> <cases-dir> [name-filter]" >&2
     exit 2
 fi
 
@@ -26,10 +26,9 @@ fi
 pietric=$(realpath "$1")
 llc=$2
 opt=$3
-cxx=$4
-runtime=$(realpath "$5")
-cases=$(realpath "$6")
-filter=${7:-}
+cc=$4
+cases=$(realpath "$5")
+filter=${6:-}
 
 compile_timeout=10
 run_timeout=5
@@ -86,7 +85,7 @@ for expected in "$cases"/*.out; do
             ll="$dir/opt.ll"
         fi
         if ! "$llc" "-$mode" -relocation-model=pic -filetype=obj "$ll" -o "$dir/prog.o" ||
-           ! "$cxx" "$dir/prog.o" "$runtime" -o "$dir/prog"; then
+           ! "$cc" "$dir/prog.o" -o "$dir/prog"; then
             report_fail "$name [$mode]" "llc or link failed"
             continue
         fi
