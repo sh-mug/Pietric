@@ -1,5 +1,4 @@
 #include "IRBuilder.h"
-#include "StackVM.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"

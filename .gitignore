@@ -23,3 +23,6 @@ Makefile
 
 # VSCode settings
 .vscode/
+
+# Expected outputs of the end-to-end tests
+!/tests/cases/*.out

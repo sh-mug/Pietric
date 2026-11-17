@@ -38,7 +38,6 @@ set(SOURCES
     src/Parser.cpp
     src/Graph.cpp
     src/IRBuilder.cpp
-    src/StackVM.cpp
     src/ImageLoader.cpp
 )
 
@@ -47,3 +46,19 @@ add_executable(Pietric ${SOURCES})
 llvm_map_components_to_libnames(llvm_libs support core irreader native)
 
 target_link_libraries(Pietric ${llvm_libs})
+
+# Runtime library that compiled Piet programs are linked against.
+add_library(PietRuntime STATIC src/StackVM.cpp)
+
+# End-to-end tests (run with `ctest` from the build directory).
+enable_testing()
+find_program(PIET_LLC llc HINTS ${LLVM_TOOLS_BINARY_DIR})
+find_program(PIET_OPT opt HINTS ${LLVM_TOOLS_BINARY_DIR})
+if(PIET_LLC AND PIET_OPT)
+  add_test(NAME piet-programs
+    COMMAND ${CMAKE_SOURCE_DIR}/tests/run_tests.sh
+            $<TARGET_FILE:Pietric> ${PIET_LLC} ${PIET_OPT} ${CMAKE_CXX_COMPILER}
+            $<TARGET_FILE:PietRuntime> ${CMAKE_SOURCE_DIR}/tests/cases)
+else()
+  message(WARNING "llc/opt not found; end-to-end tests are disabled")
+endif()
