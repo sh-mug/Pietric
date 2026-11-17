@@ -160,6 +160,50 @@ def white_turn(program):
     return [row0, row1, row2, row3]
 
 
+def exit_down(program):
+    """The last command enters the 2-codel block A at the right edge. Moving
+    right fails twice, so DP turns down with CC right, which selects the
+    leftmost codel of A's bottom edge: A -> X is out(char), after which X
+    slides into a white region with no way out. (Picking the rightmost codel
+    would give A -> Y, a pop.)
+
+        prefix  A  A
+        K...K   X  Y
+        K..K W  W  K
+    """
+    cells, a = lay_out_row(program)
+    k = len(cells)
+    assert k >= 2
+    x = hexof(step(a, "outc"))
+    y = hexof(step(a, "pop"))
+    row0 = cells + [hexof(a)] * 2
+    row1 = [BLACK] * k + [x, y]
+    row2 = [BLACK] * (k - 1) + [WHITE, WHITE, BLACK]
+    return [row0, row1, row2]
+
+
+def exit_up(program):
+    """The last command enters the 2-codel tall block E, which can only be
+    left downwards: E -> B is a dup. B can only be left upwards; the first
+    attempt is DP up with CC right, which selects the rightmost codel of B's
+    top edge: B -> Z is out(char), after which Z slides into a white region
+    with no way out. (Picking the leftmost codel would give B -> E, a div.)
+
+        prefix  E  K  W  W
+        K...K   E  K  Z  K
+        K...K   B  B  B  K
+    """
+    cells, e = lay_out_row(program)
+    k = len(cells)
+    b = step(e, "dup")
+    z = hexof(step(b, "outc"))
+    eh, bh = hexof(e), hexof(b)
+    row0 = cells + [eh, BLACK, WHITE, WHITE]
+    row1 = [BLACK] * k + [eh, BLACK, z, BLACK]
+    row2 = [BLACK] * k + [bh, bh, bh, BLACK]
+    return [row0, row1, row2]
+
+
 # Pushes 65 ('A') using only small blocks.
 PUSH_65 = ["push 8", "dup", "mul", "push 1", "add"]
 SPACE = ["push 32", "outc"]
@@ -184,6 +228,10 @@ CASES = [
     # White regions that cannot be left terminate the program.
     ("white_trap", white_trap, PUSH_65 + ["outc"], b"A", None),
     ("white_turn", white_turn, PUSH_65 + ["dup"], b"A", None),
+
+    # The exit codel of the edge facing DP is chosen by CC.
+    ("exit_down", exit_down, PUSH_65, b"A", None),
+    ("exit_up", exit_up, PUSH_65, b"A", None),
 ]
 
 

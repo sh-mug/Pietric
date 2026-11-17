@@ -129,41 +129,30 @@ Command Graph::getCommand(PietColor from, PietColor to) {
 }
 
 // --- Helper: getExitCodel ---
-// Given a block, select the exit codel (the codel in the block that is farthest in the DP direction,
-// breaking ties using the CC).
+// Given a block, select the exit codel: among the codels on the edge furthest in the DP direction,
+// the one furthest towards the CC side. The CC side is relative to the DP: "left" is the DP turned
+// 90 degrees counterclockwise and "right" is the DP turned 90 degrees clockwise. For example,
+// DP down / CC left picks the rightmost codel of the bottom edge, and DP up / CC left the leftmost
+// codel of the top edge.
 std::pair<int,int> Graph::getExitCodel(const Block &block, Direction dp, CodelChooser cc,
                                          const std::vector<std::vector<PietColor>> &grid) {
-    // Initialize with the first cell in the block.
+    // (row, col) unit vectors for Right, Down, Left, Up.
+    static const int dr[4] = { 0, 1, 0, -1 };
+    static const int dc[4] = { 1, 0, -1, 0 };
+    int d = static_cast<int>(dp);
+    int side = static_cast<int>(rotateDP(dp, cc == CodelChooser::Left ? 3 : 1));
+
+    // Distance of a cell along the DP and along the CC side.
+    auto along = [&](const std::pair<int,int> &cell, int dir) {
+        return cell.first * dr[dir] + cell.second * dc[dir];
+    };
+
     std::pair<int,int> best = block.cells[0];
     for (const auto &cell : block.cells) {
-        int r = cell.first, c = cell.second;
-        int best_r = best.first, best_c = best.second;
-        switch (dp) {
-            case Direction::Right:
-                if (c > best_c ||
-                    (c == best_c && ((cc == CodelChooser::Left && r < best_r) ||
-                                      (cc == CodelChooser::Right && r > best_r))))
-                    best = cell;
-                break;
-            case Direction::Left:
-                if (c < best_c ||
-                    (c == best_c && ((cc == CodelChooser::Left && r > best_r) ||
-                                      (cc == CodelChooser::Right && r < best_r))))
-                    best = cell;
-                break;
-            case Direction::Down:
-                if (r > best_r ||
-                    (r == best_r && ((cc == CodelChooser::Left && c < best_c) ||
-                                      (cc == CodelChooser::Right && c > best_c))))
-                    best = cell;
-                break;
-            case Direction::Up:
-                if (r < best_r ||
-                    (r == best_r && ((cc == CodelChooser::Left && c > best_c) ||
-                                      (cc == CodelChooser::Right && c < best_c))))
-                    best = cell;
-                break;
-        }
+        int primary = along(cell, d), bestPrimary = along(best, d);
+        if (primary > bestPrimary ||
+            (primary == bestPrimary && along(cell, side) > along(best, side)))
+            best = cell;
     }
     return best;
 }
