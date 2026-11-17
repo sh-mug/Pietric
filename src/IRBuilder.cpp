@@ -22,14 +22,20 @@ private:
     IntegerType *i32;
     Function *mainFunc = nullptr;
     Value *stack = nullptr;
+    Value *inputSlot = nullptr;  // receives values read by the input commands
 
     // Runtime library functions.
     FunctionCallee stackPushF, stackPopF, createStackF, destroyStackF, stackRollF;
-    FunctionCallee putcharF;
+    FunctionCallee readNumberF, readCharF, writeNumberF, writeCharF;
 
     ConstantInt *constant(int value) { return ConstantInt::get(i32, value); }
     Value *pop() { return builder.CreateCall(stackPopF, { stack }); }
     void push(Value *value) { builder.CreateCall(stackPushF, { stack, value }); }
+
+    // Emits `if (cond) { then(); }` and continues after it.
+    template <typename F> void emitIf(Value *cond, F then);
+    // Emits an input command: calls `readF` and pushes the value if one was read.
+    void emitInput(FunctionCallee readF);
 
     // Emits the command executed when leaving a block of `blockSize` codels.
     void emitCommand(Command cmd, int blockSize);
@@ -52,8 +58,33 @@ CodeGen::CodeGen(LLVMContext &ctx, Module &module)
         "destroyStack", FunctionType::get(voidTy, { stackPtrTy }, false));
     stackRollF = module.getOrInsertFunction(
         "stackRoll", FunctionType::get(voidTy, { stackPtrTy, i32, i32 }, false));
-    putcharF = module.getOrInsertFunction(
-        "putchar", FunctionType::get(i32, { i32 }, false));
+    PointerType *intPtrTy = PointerType::getUnqual(i32);
+    readNumberF = module.getOrInsertFunction(
+        "pietReadNumber", FunctionType::get(i32, { intPtrTy }, false));
+    readCharF = module.getOrInsertFunction(
+        "pietReadChar", FunctionType::get(i32, { intPtrTy }, false));
+    writeNumberF = module.getOrInsertFunction(
+        "pietWriteNumber", FunctionType::get(voidTy, { i32 }, false));
+    writeCharF = module.getOrInsertFunction(
+        "pietWriteChar", FunctionType::get(voidTy, { i32 }, false));
+}
+
+template <typename F> void CodeGen::emitIf(Value *cond, F then) {
+    BasicBlock *thenBB = BasicBlock::Create(ctx, "then", mainFunc);
+    BasicBlock *contBB = BasicBlock::Create(ctx, "cont", mainFunc);
+    builder.CreateCondBr(cond, thenBB, contBB);
+    builder.SetInsertPoint(thenBB);
+    then();
+    builder.CreateBr(contBB);
+    builder.SetInsertPoint(contBB);
+}
+
+void CodeGen::emitInput(FunctionCallee readF) {
+    // If nothing can be read (e.g. at end of input), the command is ignored.
+    Value *ok = builder.CreateCall(readF, { inputSlot });
+    emitIf(builder.CreateICmpNE(ok, constant(0)), [&] {
+        push(builder.CreateLoad(i32, inputSlot));
+    });
 }
 
 void CodeGen::emitCommand(Command cmd, int blockSize) {
@@ -119,12 +150,22 @@ void CodeGen::emitCommand(Command cmd, int blockSize) {
             builder.CreateCall(stackRollF, { stack, rolls, depth });
             break;
         }
-        case Command::OutputChar: {
-            Value *ch = pop();
-            builder.CreateCall(putcharF, { builder.CreateIntCast(ch, i32, false) });
+        case Command::InputNum:
+            emitInput(readNumberF);
             break;
-        }
-        default:
+        case Command::InputChar:
+            emitInput(readCharF);
+            break;
+        case Command::OutputNum:
+            builder.CreateCall(writeNumberF, { pop() });
+            break;
+        case Command::OutputChar:
+            builder.CreateCall(writeCharF, { pop() });
+            break;
+        case Command::None:
+        case Command::Pointer:
+        case Command::Switch:
+            // Pointer and switch are emitted as branches by emitBranch.
             break;
     }
 }
@@ -148,6 +189,8 @@ void CodeGen::emit(const Graph &graph) {
                                 "main", module);
     BasicBlock *entryBB = BasicBlock::Create(ctx, "entry", mainFunc);
     builder.SetInsertPoint(entryBB);
+
+    inputSlot = builder.CreateAlloca(i32, nullptr, "input");
 
     // Create the runtime stack.
     stack = builder.CreateCall(createStackF, {});

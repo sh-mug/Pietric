@@ -232,6 +232,17 @@ CASES = [
     # The exit codel of the edge facing DP is chosen by CC.
     ("exit_down", exit_down, PUSH_65, b"A", None),
     ("exit_up", exit_up, PUSH_65, b"A", None),
+
+    # Input and output.
+    ("out_number", linear, ["push 3", "outn"] + neg(12) + ["outn"], b"3-12", None),
+    ("in_char", linear, ["inc", "inc", "outc", "outc"], b"iH", b"Hi"),
+    # 12 + -5 = 7; +7; reading "x" as a number fails and pushes nothing (the 2
+    # below it is printed), and "x" is then read as a character; reading a
+    # character at end of input pushes nothing (the 3 below it is printed).
+    ("in_number", linear,
+     ["inn", "inn", "add", "outn", "inn", "outn",
+      "push 2", "inn", "outn", "inc", "outc", "push 3", "inc", "outn"],
+     b"772x3", b"12 -5\n+7 x"),
 ]
 
 
