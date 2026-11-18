@@ -668,17 +668,73 @@ void CodeGen::emitRoll(int next) {
 // Rolls within the window if it holds the values to roll. Else, if a full window would hold
 // them and the heap has the values to fill it, fills it and rolls within it: rolls of a few
 // values whose depth is only known at run time are common, and the window may hold fewer
-// values than they need because pops refill it only one value at a time. Else rolls on the
-// heap.
+// values than they need because pops refill it only one value at a time. Else the roll reaches
+// into the heap: by 1 or -1, which programs use to reach values deep in the stack, it moves
+// one value past the heap values it covers and leaves the rest of the window in place;
+// otherwise it moves the window to the heap and rolls there.
 void CodeGen::emitCachedRoll(Value *rollDepth, Value *rolls, int next) {
     auto inWindow = [&] {
         emitTrackedRoll(rollDepth, rolls);
         jump(next);
     };
+    // Deeper than the window. By 1 or -1, one value moves between the window and the heap,
+    // past the heap values that the roll covers, and the rest of the window stays; other rolls
+    // move the window to the heap and roll there.
     auto onHeap = [&] {
-        moveToHeap(depth);
-        emitHeapRoll(rollDepth, rolls);
-        jump(next);
+        auto throughHeap = [&] {
+            moveToHeap(depth);
+            emitHeapRoll(rollDepth, rolls);
+            jump(next);
+        };
+        if (depth == 0) {
+            throughHeap();
+            return;
+        }
+        const Align align(sizeof(int32_t));
+        auto bytes = [&](Value *count) {
+            return builder.CreateMul(count, index(sizeof(int32_t)));
+        };
+        Value *covered = builder.CreateSExt(builder.CreateSub(rollDepth, constant(depth)), i64);
+        // By 1 or by 1 - rollDepth, which is the same; likewise for -1 and rollDepth - 1.
+        Value *byOne = builder.CreateOr(
+            builder.CreateICmpEQ(rolls, constant(1)),
+            builder.CreateICmpEQ(rolls, builder.CreateSub(constant(1), rollDepth)));
+        Value *byMinusOne = builder.CreateOr(
+            builder.CreateICmpEQ(rolls, constant(-1)),
+            builder.CreateICmpEQ(rolls, builder.CreateSub(rollDepth, constant(1))));
+        emitBranch(byOne,
+            [&] {
+                // The top value goes below the covered heap values.
+                Value *top = pop();
+                Value *size = builder.CreateLoad(i64, sizeSlot, "size");
+                reserve(size, 1);
+                Value *buffer = stackBuffer();
+                Value *start = builder.CreateSub(size, covered);
+                Value *at = builder.CreateInBoundsGEP(i32, buffer, start);
+                builder.CreateMemMove(builder.CreateConstInBoundsGEP1_64(i32, at, 1), align, at,
+                                      align, bytes(covered));
+                builder.CreateStore(top, at);
+                builder.CreateStore(builder.CreateNUWAdd(size, index(1)), sizeSlot);
+                jump(next);
+            },
+            [&] {
+                emitBranch(byMinusOne,
+                    [&] {
+                        // The lowest covered heap value comes to the top.
+                        Value *size = builder.CreateLoad(i64, sizeSlot, "size");
+                        Value *buffer = stackBuffer();
+                        Value *start = builder.CreateSub(size, covered);
+                        Value *at = builder.CreateInBoundsGEP(i32, buffer, start);
+                        Value *value = builder.CreateLoad(i32, at);
+                        builder.CreateMemMove(at, align,
+                                              builder.CreateConstInBoundsGEP1_64(i32, at, 1),
+                                              align, bytes(builder.CreateSub(covered, index(1))));
+                        builder.CreateStore(builder.CreateNUWSub(size, index(1)), sizeSlot);
+                        push(value);
+                        jump(next);
+                    },
+                    throughHeap);
+            });
     };
     emitBranch(builder.CreateICmpSLE(rollDepth, constant(depth)), inWindow, [&] {
         if (depth == kWindowSize) {
