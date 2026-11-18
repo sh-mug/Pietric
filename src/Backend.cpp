@@ -101,6 +101,14 @@ std::vector<std::string> Backend::optOptions() const {
     return options;
 }
 
+std::vector<std::string> Backend::llcOptions() const {
+    std::vector<std::string> options = toolOptions();
+    // Tail merging (in the control flow optimizer) takes most of llc's time for large programs,
+    // whose functions have many similar blocks.
+    options.push_back("-enable-tail-merge=false");
+    return options;
+}
+
 Backend::~Backend() {
     for (const std::string &path : temporaries)
         sys::fs::remove(path);
@@ -176,7 +184,7 @@ bool Backend::writeObject(Module &module, const std::string &path, std::string &
     }
     // Position-independent code, since C compilers commonly link position-independent
     // executables by default.
-    std::vector<std::string> args = toolOptions();
+    std::vector<std::string> args = llcOptions();
     args.insert(args.end(), { "-relocation-model=pic", "-filetype=obj", bitcode, "-o", path });
     return run(llc, args, error);
 }
