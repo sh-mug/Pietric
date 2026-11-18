@@ -79,6 +79,7 @@ Options:
 | `--emit-llvm` | Write LLVM IR, after optimization at the chosen level, instead of an executable |
 | `-c` | Write an object file instead of an executable |
 | `--cc=<program>` | C compiler used for linking (default `cc`) |
+| `-march=<cpu>` | Generate code for the given CPU, e.g. `-march=native` for this machine's or `-march=x86-64-v3`. Faster where loops vectorize, but the executable may not run on older CPUs. Default: any CPU of the host's architecture |
 | `-v` | Report the codel size detected in an image |
 
 The IR from `--emit-llvm` can also be built with LLVM's tools, for example:

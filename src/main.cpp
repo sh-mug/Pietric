@@ -34,6 +34,11 @@ static cl::opt<bool> emitLLVM("emit-llvm",
 static cl::opt<bool> compileOnly("c",
     cl::desc("Write an object file instead of an executable"), cl::cat(pietricCategory));
 
+static cl::opt<std::string> targetCPU("march",
+    cl::desc("Generate code for <cpu>, or for this machine's CPU with -march=native "
+             "(default: any CPU of the host's architecture)"),
+    cl::value_desc("cpu"), cl::cat(pietricCategory));
+
 static cl::opt<std::string> linker("cc",
     cl::desc("C compiler used to link the executable (default: cc)"), cl::value_desc("program"),
     cl::init("cc"), cl::cat(pietricCategory));
@@ -86,7 +91,7 @@ int main(int argc, char **argv) {
 
     // 4. Optimize, and write the IR, an object file or an executable.
     std::string error;
-    std::unique_ptr<Backend> backend = Backend::create(optLevel, linker, error);
+    std::unique_ptr<Backend> backend = Backend::create(optLevel, targetCPU, linker, error);
     if (!backend)
         return fail(error);
     bool ok = emitLLVM      ? backend->writeIR(*module, output, error)

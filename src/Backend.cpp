@@ -8,6 +8,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/TargetParser/X86TargetParser.h"
 
 using namespace llvm;
 
@@ -40,6 +41,15 @@ void targetHost(Module &module) {
 #endif
 }
 
+// Whether the tools know `cpu` for the host. Only checked for x86, where opt and llc crash on
+// an unknown CPU; for other targets they warn and fall back to a generic one.
+bool knownCPU(const std::string &cpu) {
+    Triple host(sys::getDefaultTargetTriple());
+    if (cpu.empty() || cpu == "native" || !host.isX86())
+        return true;
+    return X86::parseArchX86(cpu, host.isArch64Bit()) != X86::CK_None;
+}
+
 bool writeText(Module &module, const std::string &path, std::string &error) {
     std::error_code ec;
     raw_fd_ostream out(path, ec, sys::fs::OF_Text);
@@ -53,8 +63,12 @@ bool writeText(Module &module, const std::string &path, std::string &error) {
 
 } // namespace
 
-std::unique_ptr<Backend> Backend::create(unsigned optLevel, const std::string &cc,
-                                         std::string &error) {
+std::unique_ptr<Backend> Backend::create(unsigned optLevel, const std::string &cpu,
+                                         const std::string &cc, std::string &error) {
+    if (!knownCPU(cpu)) {
+        error = "unknown CPU '" + cpu + "' for -march";
+        return nullptr;
+    }
     std::string opt, llc;
     if (!findLLVMTool("opt", opt, error) || !findLLVMTool("llc", llc, error))
         return nullptr;
@@ -63,11 +77,21 @@ std::unique_ptr<Backend> Backend::create(unsigned optLevel, const std::string &c
         error = "cannot find the C compiler '" + cc + "' to link with (see --cc)";
         return nullptr;
     }
-    return std::unique_ptr<Backend>(new Backend(optLevel, opt, llc, *ccPath));
+    return std::unique_ptr<Backend>(new Backend(optLevel, cpu, opt, llc, *ccPath));
 }
 
-Backend::Backend(unsigned optLevel, std::string opt, std::string llc, std::string cc)
-    : optLevel(optLevel), opt(std::move(opt)), llc(std::move(llc)), cc(std::move(cc)) { }
+Backend::Backend(unsigned optLevel, std::string cpu, std::string opt, std::string llc,
+                 std::string cc)
+    : optLevel(optLevel), cpu(std::move(cpu)), opt(std::move(opt)), llc(std::move(llc)),
+      cc(std::move(cc)) { }
+
+std::vector<std::string> Backend::toolOptions() const {
+    std::vector<std::string> options = { "-O" + std::to_string(optLevel) };
+    // opt needs the CPU too: what is worth vectorizing, for one, depends on it.
+    if (!cpu.empty())
+        options.push_back("-mcpu=" + cpu);
+    return options;
+}
 
 Backend::~Backend() {
     for (const std::string &path : temporaries)
@@ -121,8 +145,11 @@ bool Backend::writeIR(Module &module, const std::string &path, std::string &erro
         return writeText(module, path, error);
     }
     std::string bitcode;
-    return writeBitcode(module, bitcode, error) &&
-           run(opt, { "-O" + std::to_string(optLevel), "-S", bitcode, "-o", path }, error);
+    if (!writeBitcode(module, bitcode, error))
+        return false;
+    std::vector<std::string> args = toolOptions();
+    args.insert(args.end(), { "-S", bitcode, "-o", path });
+    return run(opt, args, error);
 }
 
 bool Backend::writeObject(Module &module, const std::string &path, std::string &error) {
@@ -131,15 +158,19 @@ bool Backend::writeObject(Module &module, const std::string &path, std::string &
         return false;
     if (optLevel > 0) {
         std::string optimized;
-        if (!temporary("bc", optimized, error) ||
-            !run(opt, { "-O" + std::to_string(optLevel), bitcode, "-o", optimized }, error))
+        if (!temporary("bc", optimized, error))
+            return false;
+        std::vector<std::string> args = toolOptions();
+        args.insert(args.end(), { bitcode, "-o", optimized });
+        if (!run(opt, args, error))
             return false;
         bitcode = optimized;
     }
     // Position-independent code, since C compilers commonly link position-independent
     // executables by default.
-    return run(llc, { "-O" + std::to_string(optLevel), "-relocation-model=pic",
-                      "-filetype=obj", bitcode, "-o", path }, error);
+    std::vector<std::string> args = toolOptions();
+    args.insert(args.end(), { "-relocation-model=pic", "-filetype=obj", bitcode, "-o", path });
+    return run(llc, args, error);
 }
 
 bool Backend::writeExecutable(Module &module, const std::string &path, std::string &error) {
