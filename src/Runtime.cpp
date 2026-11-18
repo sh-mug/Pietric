@@ -129,6 +129,9 @@ Function *RuntimeBuilder::defineReverse() {
     return f;
 }
 
+// Rolls that move at most this many values past the others go through a buffer of this size.
+constexpr int64_t kRollBufferSize = 64;
+
 Function *RuntimeBuilder::defineRoll(Function *reverse) {
     Function *f = define("piet.roll", FunctionType::get(voidTy, { ptr, i32, i32 }, false));
     Value *base = f->getArg(0);
@@ -138,6 +141,8 @@ Function *RuntimeBuilder::defineRoll(Function *reverse) {
     BasicBlock *normalizeBB = BasicBlock::Create(ctx, "normalize", f);
     BasicBlock *rotateBB = BasicBlock::Create(ctx, "rotate", f);
     BasicBlock *doneBB = BasicBlock::Create(ctx, "done", f);
+    Value *buffer =
+        builder.CreateAlloca(ArrayType::get(i32, kRollBufferSize), nullptr, "buffer");
 
     // Rolling fewer than two values changes nothing (and depth 0 cannot be divided by).
     builder.CreateCondBr(builder.CreateICmpSLT(depth, builder.getInt32(2)), doneBB, normalizeBB);
@@ -150,11 +155,44 @@ Function *RuntimeBuilder::defineRoll(Function *reverse) {
     Value *r = builder.CreateSelect(isNegative, builder.CreateAdd(rem, depth), rem);
     builder.CreateCondBr(builder.CreateICmpEQ(r, builder.getInt32(0)), doneBB, rotateBB);
 
-    // Rotate in place: base[n-r..n) followed by base[0..n-r) is what reversing the whole range,
-    // then its first r and its last n-r values gives.
+    // Rotate in place: base[n-r..n) followed by base[0..n-r). If one of the two parts is
+    // short (rolls are mostly by 1 or -1), it is saved in a buffer while memmove shifts the
+    // other part; otherwise reverse the whole range, then its first r and its last n-r values.
     builder.SetInsertPoint(rotateBB);
     Value *n = builder.CreateZExt(depth, i64);
     Value *k = builder.CreateZExt(r, i64);
+    Value *rest = builder.CreateSub(n, k);
+    Value *bufferSize = ConstantInt::get(i64, kRollBufferSize);
+    BasicBlock *shortTopBB = BasicBlock::Create(ctx, "short_top", f, doneBB);
+    BasicBlock *checkBottomBB = BasicBlock::Create(ctx, "check_bottom", f, doneBB);
+    BasicBlock *shortBottomBB = BasicBlock::Create(ctx, "short_bottom", f, doneBB);
+    BasicBlock *reverseBB = BasicBlock::Create(ctx, "reverse", f, doneBB);
+    builder.CreateCondBr(builder.CreateICmpULE(k, bufferSize), shortTopBB, checkBottomBB);
+
+    const Align align(sizeof(int32_t));
+    auto bytes = [&](Value *count) {
+        return builder.CreateMul(count, ConstantInt::get(i64, sizeof(int32_t)));
+    };
+    auto at = [&](Value *i) { return builder.CreateInBoundsGEP(i32, base, i); };
+
+    // The top r values go to the buffer, the others r places up, then the buffer to the bottom.
+    builder.SetInsertPoint(shortTopBB);
+    builder.CreateMemCpy(buffer, align, at(rest), align, bytes(k));
+    builder.CreateMemMove(at(k), align, base, align, bytes(rest));
+    builder.CreateMemCpy(base, align, buffer, align, bytes(k));
+    builder.CreateBr(doneBB);
+
+    builder.SetInsertPoint(checkBottomBB);
+    builder.CreateCondBr(builder.CreateICmpULE(rest, bufferSize), shortBottomBB, reverseBB);
+
+    // The bottom n-r values go to the buffer, the others to the bottom, then the buffer on top.
+    builder.SetInsertPoint(shortBottomBB);
+    builder.CreateMemCpy(buffer, align, base, align, bytes(rest));
+    builder.CreateMemMove(base, align, at(rest), align, bytes(k));
+    builder.CreateMemCpy(at(k), align, buffer, align, bytes(rest));
+    builder.CreateBr(doneBB);
+
+    builder.SetInsertPoint(reverseBB);
     Value *zero = ConstantInt::get(i64, 0);
     builder.CreateCall(reverse, { base, zero, n });
     builder.CreateCall(reverse, { base, zero, k });
