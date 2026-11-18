@@ -1,6 +1,7 @@
 #include "IRBuilder.h"
 #include "Runtime.h"
 #include "llvm/IR/IRBuilder.h"
+#include <algorithm>
 #include <cassert>
 #include <deque>
 #include <map>
@@ -20,9 +21,14 @@ constexpr int kWindowSize = 8;
 // How many values a full window moves to the heap at once.
 constexpr int kEvictCount = kWindowSize / 2;
 static_assert(kWindowSize <= kMaxTrackedDepth, "the window lives in the depth-tracked slots");
-// Upper bound on the number of depth-tracked and cached node copies, which keeps the code size
-// of large programs in check. Nodes reached beyond it are emitted generically.
-constexpr size_t kMaxTrackedCopies = 16384;
+// Upper bounds on the number of depth-tracked and of cached node copies, which keep the code size
+// of large programs in check. Copies are created breadth-first from the start, so depth-tracked
+// copies of shallow states, many on paths that are never taken, would use up a shared budget
+// before the loops that run with deeper stacks get theirs. Past the depth-tracked budget,
+// execution continues in cached copies, of which a node has at most kWindowSize + 1; past theirs,
+// in generic copies.
+constexpr size_t kMaxTrackedCopies = 8192;
+constexpr size_t kMaxCachedCopies = 24576;
 // Number of values the heap stack has room for before it first has to grow.
 constexpr int64_t kInitialStackCapacity = 1024;
 static_assert(kInitialStackCapacity > kMaxTrackedDepth, "spilling must not need to grow");
@@ -57,8 +63,8 @@ constexpr int kGenericKey = -1;
 // the window holds first checks the heap and moves the values it needs back, and a roll deeper
 // than the window moves the whole window to the heap and rolls there.
 //
-// Past kMaxTrackedCopies, execution continues in generic copies, which keep every value on the
-// heap and emit push and pop inline.
+// Past kMaxTrackedCopies, execution continues in cached copies, and past kMaxCachedCopies in
+// generic copies, which keep every value on the heap and emit push and pop inline.
 class CodeGen {
 public:
     CodeGen(LLVMContext &ctx, Module &module);
@@ -97,7 +103,7 @@ private:
     // Node copies, keyed by (node index, state key), and the ones still to be emitted.
     std::map<std::pair<int, int>, BasicBlock *> copies;
     std::deque<std::pair<int, int>> pending;
-    size_t trackedCopies = 0;
+    size_t trackedCopies = 0, cachedCopies = 0;
 
     ConstantInt *constant(int value) { return ConstantInt::get(i32, value); }
     ConstantInt *index(int64_t value) { return ConstantInt::get(i64, value); }
@@ -108,8 +114,9 @@ private:
     // Returns the block of the copy of `node` for the state `key`, creating it if needed.
     BasicBlock *copyOf(int node, int key);
     // Ends the current block with a branch to the copy of `node` for the current state. If that
-    // would need a depth-tracked or cached copy beyond kMaxTrackedCopies, moves the stack to
-    // the heap first and continues generically.
+    // would need a depth-tracked copy beyond kMaxTrackedCopies, spills first; if it would need a
+    // cached copy beyond kMaxCachedCopies, moves the window to the heap and continues
+    // generically.
     void jump(int node);
 
     // --- Stack operations, for every kind of copy ---
@@ -119,9 +126,9 @@ private:
     // not be either (emitIfStackHas sees to that).
     Value *pop();
     void push(Value *value);
-    // Moves the bottom values of a full depth-tracked stack to a new heap buffer and continues
-    // with the top ones as the window, or with the whole stack on the heap if !keepWindow.
-    void spill(bool keepWindow);
+    // Moves a depth-tracked stack to a new heap buffer, except for (at most) the top
+    // kWindowSize - kEvictCount values, and continues with these as the window.
+    void spill();
     // Moves the bottom `count` values of the slots to the top of the heap stack.
     void moveToHeap(int count);
     // Moves `count` values from the top of the heap stack, which must hold them, to the bottom
@@ -182,19 +189,19 @@ BasicBlock *CodeGen::copyOf(int node, int stateKey) {
     BasicBlock *bb = BasicBlock::Create(ctx, name, mainFunc);
     copies.emplace(key, bb);
     pending.push_back(key);
-    if (stateKey != kGenericKey)
+    if (stateKey >= kCachedKey)
+        cachedCopies++;
+    else if (stateKey != kGenericKey)
         trackedCopies++;
     return bb;
 }
 
 void CodeGen::jump(int node) {
-    if (!generic() && !copies.count({ node, stateKey() }) && trackedCopies >= kMaxTrackedCopies) {
-        if (tracked()) {
-            spill(false);
-        } else {
-            moveToHeap(depth);
-            mode = Mode::Generic;
-        }
+    if (tracked() && !copies.count({ node, stateKey() }) && trackedCopies >= kMaxTrackedCopies)
+        spill();
+    if (cached() && !copies.count({ node, stateKey() }) && cachedCopies >= kMaxCachedCopies) {
+        moveToHeap(depth);
+        mode = Mode::Generic;
     }
     builder.CreateBr(copyOf(node, stateKey()));
 }
@@ -220,7 +227,7 @@ Value *CodeGen::pop() {
 
 void CodeGen::push(Value *value) {
     if (tracked() && depth == kMaxTrackedDepth)
-        spill(true);
+        spill();
     else if (cached() && depth == kWindowSize)
         moveToHeap(kEvictCount);
     if (!generic()) {
@@ -245,7 +252,7 @@ void CodeGen::reserve(Value *size, int count) {
     });
 }
 
-void CodeGen::spill(bool keepWindow) {
+void CodeGen::spill() {
     assert(tracked());
     Value *buffer = builder.CreateCall(
         runtime.malloc, { index(kInitialStackCapacity * sizeof(int32_t)) }, "buffer");
@@ -254,12 +261,7 @@ void CodeGen::spill(bool keepWindow) {
     builder.CreateStore(index(kInitialStackCapacity), capacitySlot);
     builder.CreateStore(buffer, bufferSlot);
     mode = Mode::Cached;
-    if (keepWindow) {
-        moveToHeap(depth - (kWindowSize - kEvictCount));
-    } else {
-        moveToHeap(depth);
-        mode = Mode::Generic;
-    }
+    moveToHeap(std::max(0, depth - (kWindowSize - kEvictCount)));
 }
 
 void CodeGen::moveToHeap(int count) {
