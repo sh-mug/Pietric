@@ -27,8 +27,9 @@ public:
 private:
     Backend(unsigned optLevel, std::string cpu, std::string opt, std::string llc,
             std::string cc);
-    // The options for opt and llc: the optimization level and the CPU.
+    // The options for opt and llc: the optimization level and the CPU; and those for opt.
     std::vector<std::string> toolOptions() const;
+    std::vector<std::string> optOptions() const;
     // Targets the module at the host and writes it as bitcode to a temporary file.
     bool writeBitcode(llvm::Module &module, std::string &path, std::string &error);
     // Returns a new temporary file name with the given extension.

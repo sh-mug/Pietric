@@ -93,6 +93,14 @@ std::vector<std::string> Backend::toolOptions() const {
     return options;
 }
 
+std::vector<std::string> Backend::optOptions() const {
+    std::vector<std::string> options = toolOptions();
+    // The SLP vectorizer finds little to vectorize in the code Pietric generates, and the
+    // selects of rolls give it much to try: it took half of opt's time for large programs.
+    options.push_back("-vectorize-slp=false");
+    return options;
+}
+
 Backend::~Backend() {
     for (const std::string &path : temporaries)
         sys::fs::remove(path);
@@ -147,7 +155,7 @@ bool Backend::writeIR(Module &module, const std::string &path, std::string &erro
     std::string bitcode;
     if (!writeBitcode(module, bitcode, error))
         return false;
-    std::vector<std::string> args = toolOptions();
+    std::vector<std::string> args = optOptions();
     args.insert(args.end(), { "-S", bitcode, "-o", path });
     return run(opt, args, error);
 }
@@ -160,7 +168,7 @@ bool Backend::writeObject(Module &module, const std::string &path, std::string &
         std::string optimized;
         if (!temporary("bc", optimized, error))
             return false;
-        std::vector<std::string> args = toolOptions();
+        std::vector<std::string> args = optOptions();
         args.insert(args.end(), { bitcode, "-o", optimized });
         if (!run(opt, args, error))
             return false;
