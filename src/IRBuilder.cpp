@@ -416,8 +416,7 @@ void CodeGen::emitCommand(Command cmd, int blockSize, int next) {
         case Command::OutputChar:
             emitIfStackHas(1,
                 [&] {
-                    // out(char) writes the low byte, as putchar does.
-                    builder.CreateCall(runtime.putchar, { pop() });
+                    builder.CreateCall(runtime.writeChar, { pop() });
                     jump(next);
                 },
                 proceed);
@@ -476,7 +475,8 @@ void CodeGen::emitPointerSwitch(const GraphNode &node) {
 
 void CodeGen::emitNode(const GraphNode &node) {
     if (node.transitions.empty()) {
-        // Terminal state: free the heap stack, if any, and return.
+        // Terminal state: write out the output, free the heap stack, if any, and return.
+        builder.CreateCall(runtime.flush);
         if (generic())
             builder.CreateCall(runtime.free, { stackBuffer() });
         builder.CreateRet(constant(0));
@@ -508,6 +508,7 @@ void CodeGen::emit(const Graph &graph) {
     capacitySlot = builder.CreateAlloca(i64, nullptr, "capacity.slot");
     bufferSlot = builder.CreateAlloca(ptr, nullptr, "buffer.slot");
 
+    builder.CreateCall(runtime.start);
     // Execution starts at node 0 with an empty stack.
     depth = 0;
     jump(0);

@@ -23,12 +23,21 @@ struct Runtime {
     llvm::Function *readNumber;
     // { i1, i32 } (): reads one byte from stdin. Returns false at end of input.
     llvm::Function *readChar;
+    // Output is collected in a buffer of the module and written to stdout
+    // with write(2) when the buffer is full, before reading input and when
+    // the program ends; when stdout is a terminal, also after each newline.
+    //
+    // void (): decides how to buffer stdout. Called once at the start.
+    llvm::Function *start;
     // void (i32): writes a value to stdout as a decimal number.
     llvm::Function *writeNumber;
+    // void (i32): writes the low byte of a value to stdout.
+    llvm::Function *writeChar;
+    // void (): writes out the buffered output.
+    llvm::Function *flush;
 
     llvm::FunctionCallee malloc;
     llvm::FunctionCallee free;
-    llvm::FunctionCallee putchar;
 };
 
 // Defines the runtime functions in `module`.

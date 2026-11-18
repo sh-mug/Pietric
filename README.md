@@ -1,6 +1,6 @@
 # Pietric
 
-Pietric is a C++-centric compiler for the Piet programming language. Piet is an esoteric, stack-based language where programs are painted as abstract images. This compiler uses LLVM IR as its intermediate representation and then generates machine code. The Piet stack and I/O are implemented directly in the generated IR, so LLVM's optimizer can see through every operation, and the resulting program needs nothing but the C standard library.
+Pietric is a C++-centric compiler for the Piet programming language. Piet is an esoteric, stack-based language where programs are painted as abstract images. This compiler uses LLVM IR as its intermediate representation and then generates machine code. The Piet stack and I/O are implemented directly in the generated IR, so LLVM's optimizer can see through every operation, and the resulting program needs nothing but the C library (with the POSIX functions `write` and `isatty`).
 
 ## File Structure
 
@@ -68,7 +68,7 @@ Pietric takes a Piet program, either an image (PNG, GIF or BMP) or a text file o
 ./Pietric path/to/program.png -o program
 ./program
 ```
-Behind the scenes Pietric runs LLVM's `opt` and `llc` (those of the LLVM it was built with, or else the ones on the `PATH`) to optimize the program and generate machine code for the host, and links it with the C compiler `cc`; the program needs only the C standard library.
+Behind the scenes Pietric runs LLVM's `opt` and `llc` (those of the LLVM it was built with, or else the ones on the `PATH`) to optimize the program and generate machine code for the host, and links it with the C compiler `cc`; the program needs only the C library.
 
 Options:
 
@@ -104,6 +104,7 @@ Pietric follows the [Piet specification](https://www.dangermouse.net/esoteric/pi
 - `roll` with a negative depth, or a depth greater than the number of remaining values, is ignored and leaves its two arguments on the stack.
 - `pointer` turns the DP clockwise by the popped value modulo 4 (anticlockwise for negative values); `switch` toggles the CC the absolute value of the popped value times.
 - `in(number)` skips whitespace and reads an optionally signed decimal integer; `in(char)` reads one byte. If nothing can be read (end of input, or no number at the current position), nothing is pushed. `out(char)` writes the low byte of the value.
+- Output is buffered in the program and written out when 64 KiB have accumulated, before the program reads input, and when it ends; if stdout is a terminal, also after each newline. A program that is killed loses the output it has not written out yet.
 - Sliding through white codels follows the 2008 clarification of the specification: the program terminates when it would retrace its route within a white region.
 - The program starts at the top-left codel; if it is black or white, the compiled program does nothing.
 - All colors other than the 20 Piet colors are treated as one extra color: its codels form blocks like any other color, but moving into or out of them never executes a command.

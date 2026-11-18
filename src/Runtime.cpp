@@ -19,23 +19,35 @@ private:
     PointerType *ptr;
 
     Function *define(const char *name, FunctionType *type);
-    Function *defineOutOfMemory();
+    Function *defineOutOfMemory(Function *flush);
     Function *defineGrow(Function *outOfMemory);
     Function *defineReverse();
     Function *defineRoll(Function *reverse);
 
+    // Output is collected in piet.out (piet.out_length bytes so far).
+    // piet.out_lines is set if stdout is a terminal: then each newline is
+    // written out at once, as stdio does.
+    GlobalVariable *outBuffer = nullptr, *outLength = nullptr, *outLines = nullptr;
+    Function *flushF = nullptr;
+    Function *defineFlush();
+    Function *defineStart();
+    Function *defineWriteChar();
+    Function *defineWriteNumber();
+
     // Input goes through piet.getc, which returns a character put back by
     // piet.read_number before reading a new one.
     GlobalVariable *lookahead = nullptr;
-    FunctionCallee fflushF;
     Function *defineGetc();
     Function *defineReadNumber(Function *getc);
     Function *defineReadChar(Function *getc);
-    Function *defineWriteNumber();
-    // Flushes stdout before reading, so that a prompt is visible before the
-    // program waits for input.
+    // Writes out the buffered output before reading, so that a prompt is
+    // visible before the program waits for input.
     void flushOutput();
 };
+
+// The size of the output buffer, and the longest decimal number (-2147483648).
+constexpr int64_t kOutputBufferSize = 1 << 16;
+constexpr int64_t kMaxNumberLength = 11;
 
 RuntimeBuilder::RuntimeBuilder(Module &module)
     : module(module), ctx(module.getContext()), builder(ctx), voidTy(builder.getVoidTy()),
@@ -48,7 +60,7 @@ Function *RuntimeBuilder::define(const char *name, FunctionType *type) {
     return f;
 }
 
-Function *RuntimeBuilder::defineOutOfMemory() {
+Function *RuntimeBuilder::defineOutOfMemory(Function *flush) {
     FunctionCallee perrorF =
         module.getOrInsertFunction("perror", FunctionType::get(voidTy, { ptr }, false));
     FunctionCallee exitF =
@@ -57,6 +69,7 @@ Function *RuntimeBuilder::defineOutOfMemory() {
     Function *f = define("piet.out_of_memory", FunctionType::get(voidTy, false));
     f->addFnAttr(Attribute::NoReturn);
     f->addFnAttr(Attribute::Cold);
+    builder.CreateCall(flush);  // what the program printed before running out
     builder.CreateCall(perrorF, { builder.CreateGlobalString("piet", "piet.name") });
     builder.CreateCall(exitF, { builder.getInt32(1) });
     builder.CreateUnreachable();
@@ -205,7 +218,160 @@ Function *RuntimeBuilder::defineRoll(Function *reverse) {
 }
 
 void RuntimeBuilder::flushOutput() {
-    builder.CreateCall(fflushF, { ConstantPointerNull::get(ptr) });  // fflush(NULL)
+    builder.CreateCall(flushF);
+}
+
+// void piet.flush(): writes out piet.out[0..piet.out_length). Write errors (say, a closed
+// pipe) drop the output, as they would with stdio.
+Function *RuntimeBuilder::defineFlush() {
+    FunctionCallee writeF =
+        module.getOrInsertFunction("write", FunctionType::get(i64, { i32, ptr, i64 }, false));
+    Function *f = define("piet.flush", FunctionType::get(voidTy, false));
+    f->addFnAttr(Attribute::NoInline);
+    BasicBlock *entryBB = builder.GetInsertBlock();
+    BasicBlock *writeBB = BasicBlock::Create(ctx, "write", f);
+    BasicBlock *nextBB = BasicBlock::Create(ctx, "next", f);
+    BasicBlock *doneBB = BasicBlock::Create(ctx, "done", f);
+    Value *length = builder.CreateLoad(i64, outLength);
+    builder.CreateCondBr(builder.CreateICmpEQ(length, ConstantInt::get(i64, 0)), doneBB, writeBB);
+
+    // write() may write less than asked; continue with the rest.
+    builder.SetInsertPoint(writeBB);
+    PHINode *offset = builder.CreatePHI(i64, 2, "offset");
+    offset->addIncoming(ConstantInt::get(i64, 0), entryBB);
+    Value *from = builder.CreateInBoundsGEP(builder.getInt8Ty(), outBuffer, offset);
+    Value *left = builder.CreateSub(length, offset);
+    Value *written = builder.CreateCall(writeF, { builder.getInt32(1), from, left });
+    builder.CreateCondBr(builder.CreateICmpSGT(written, ConstantInt::get(i64, 0)), nextBB, doneBB);
+
+    builder.SetInsertPoint(nextBB);
+    Value *nextOffset = builder.CreateAdd(offset, written);
+    offset->addIncoming(nextOffset, nextBB);
+    builder.CreateCondBr(builder.CreateICmpSLT(nextOffset, length), writeBB, doneBB);
+
+    builder.SetInsertPoint(doneBB);
+    builder.CreateStore(ConstantInt::get(i64, 0), outLength);
+    builder.CreateRetVoid();
+    return f;
+}
+
+// void piet.start(): buffers stdout by lines if it is a terminal.
+Function *RuntimeBuilder::defineStart() {
+    FunctionCallee isattyF =
+        module.getOrInsertFunction("isatty", FunctionType::get(i32, { i32 }, false));
+    Function *f = define("piet.start", FunctionType::get(voidTy, false));
+    Value *terminal = builder.CreateCall(isattyF, { builder.getInt32(1) });
+    builder.CreateStore(builder.CreateICmpNE(terminal, builder.getInt32(0)), outLines);
+    builder.CreateRetVoid();
+    return f;
+}
+
+// void piet.write_char(i32 c)
+Function *RuntimeBuilder::defineWriteChar() {
+    Function *f = define("piet.write_char", FunctionType::get(voidTy, { i32 }, false));
+    BasicBlock *entryBB = builder.GetInsertBlock();
+    BasicBlock *fullBB = BasicBlock::Create(ctx, "full", f);
+    BasicBlock *storeBB = BasicBlock::Create(ctx, "store", f);
+    BasicBlock *lineBB = BasicBlock::Create(ctx, "line", f);
+    BasicBlock *doneBB = BasicBlock::Create(ctx, "done", f);
+    Value *length = builder.CreateLoad(i64, outLength);
+    Value *isFull = builder.CreateICmpEQ(length, ConstantInt::get(i64, kOutputBufferSize));
+    builder.CreateCondBr(isFull, fullBB, storeBB);
+
+    builder.SetInsertPoint(fullBB);
+    flushOutput();
+    builder.CreateBr(storeBB);
+
+    builder.SetInsertPoint(storeBB);
+    PHINode *at = builder.CreatePHI(i64, 2, "at");
+    at->addIncoming(length, entryBB);
+    at->addIncoming(ConstantInt::get(i64, 0), fullBB);
+    Value *byte = builder.CreateTrunc(f->getArg(0), builder.getInt8Ty());
+    builder.CreateStore(byte, builder.CreateInBoundsGEP(builder.getInt8Ty(), outBuffer, at));
+    builder.CreateStore(builder.CreateAdd(at, ConstantInt::get(i64, 1)), outLength);
+    Value *isNewline = builder.CreateICmpEQ(byte, builder.getInt8('\n'));
+    builder.CreateCondBr(isNewline, lineBB, doneBB);
+
+    builder.SetInsertPoint(lineBB);
+    BasicBlock *flushBB = BasicBlock::Create(ctx, "flush", f, doneBB);
+    builder.CreateCondBr(builder.CreateLoad(builder.getInt1Ty(), outLines), flushBB, doneBB);
+    builder.SetInsertPoint(flushBB);
+    flushOutput();
+    builder.CreateBr(doneBB);
+
+    builder.SetInsertPoint(doneBB);
+    builder.CreateRetVoid();
+    return f;
+}
+
+// void piet.write_number(i32 v): writes v in decimal (without a newline).
+Function *RuntimeBuilder::defineWriteNumber() {
+    Type *i8 = builder.getInt8Ty();
+    Function *f = define("piet.write_number", FunctionType::get(voidTy, { i32 }, false));
+    Value *value = f->getArg(0);
+    BasicBlock *entryBB = builder.GetInsertBlock();
+    BasicBlock *fullBB = BasicBlock::Create(ctx, "full", f);
+    BasicBlock *convertBB = BasicBlock::Create(ctx, "convert", f);
+    BasicBlock *digitsBB = BasicBlock::Create(ctx, "digits", f);
+    BasicBlock *copyBB = BasicBlock::Create(ctx, "copy", f);
+    BasicBlock *doneBB = BasicBlock::Create(ctx, "done", f);
+    // The digits, last one first.
+    Value *digits = builder.CreateAlloca(ArrayType::get(i8, kMaxNumberLength), nullptr, "digits");
+    Value *length = builder.CreateLoad(i64, outLength);
+    Value *isFull = builder.CreateICmpSGT(
+        length, ConstantInt::get(i64, kOutputBufferSize - kMaxNumberLength));
+    builder.CreateCondBr(isFull, fullBB, convertBB);
+
+    builder.SetInsertPoint(fullBB);
+    flushOutput();
+    builder.CreateBr(convertBB);
+
+    // The magnitude, as an unsigned number (so that -2147483648 has one too).
+    builder.SetInsertPoint(convertBB);
+    PHINode *start = builder.CreatePHI(i64, 2, "start");
+    start->addIncoming(length, entryBB);
+    start->addIncoming(ConstantInt::get(i64, 0), fullBB);
+    Value *negative = builder.CreateICmpSLT(value, builder.getInt32(0));
+    Value *magnitude =
+        builder.CreateSelect(negative, builder.CreateSub(builder.getInt32(0), value), value);
+    builder.CreateBr(digitsBB);
+
+    builder.SetInsertPoint(digitsBB);
+    PHINode *count = builder.CreatePHI(i64, 2, "count");
+    PHINode *rest = builder.CreatePHI(i32, 2, "rest");
+    Value *lastDigit = builder.CreateURem(rest, builder.getInt32(10));
+    Value *digit = builder.CreateAdd(builder.CreateTrunc(lastDigit, i8), builder.getInt8('0'));
+    builder.CreateStore(digit, builder.CreateInBoundsGEP(i8, digits, count));
+    Value *nextCount = builder.CreateAdd(count, ConstantInt::get(i64, 1));
+    Value *nextRest = builder.CreateUDiv(rest, builder.getInt32(10));
+    count->addIncoming(ConstantInt::get(i64, 0), convertBB);
+    count->addIncoming(nextCount, digitsBB);
+    rest->addIncoming(magnitude, convertBB);
+    rest->addIncoming(nextRest, digitsBB);
+    builder.CreateCondBr(builder.CreateICmpNE(nextRest, builder.getInt32(0)), digitsBB, copyBB);
+
+    // The sign, then the digits in order.
+    builder.SetInsertPoint(copyBB);
+    BasicBlock *signBB = builder.GetInsertBlock();
+    Value *signAt = builder.CreateInBoundsGEP(i8, outBuffer, start);
+    builder.CreateStore(builder.getInt8('-'), signAt);  // overwritten below if not negative
+    Value *first = builder.CreateAdd(start, builder.CreateZExt(negative, i64));
+    BasicBlock *loopBB = BasicBlock::Create(ctx, "copy_digit", f, doneBB);
+    builder.CreateBr(loopBB);
+    builder.SetInsertPoint(loopBB);
+    PHINode *i = builder.CreatePHI(i64, 2, "i");
+    i->addIncoming(ConstantInt::get(i64, 0), signBB);
+    Value *from = builder.CreateSub(builder.CreateSub(nextCount, i), ConstantInt::get(i64, 1));
+    Value *c = builder.CreateLoad(i8, builder.CreateInBoundsGEP(i8, digits, from));
+    builder.CreateStore(c, builder.CreateInBoundsGEP(i8, outBuffer, builder.CreateAdd(first, i)));
+    Value *nextI = builder.CreateAdd(i, ConstantInt::get(i64, 1));
+    i->addIncoming(nextI, loopBB);
+    builder.CreateCondBr(builder.CreateICmpULT(nextI, nextCount), loopBB, doneBB);
+
+    builder.SetInsertPoint(doneBB);
+    builder.CreateStore(builder.CreateAdd(first, nextCount), outLength);
+    builder.CreateRetVoid();
+    return f;
 }
 
 // i32 piet.getc()
@@ -311,30 +477,30 @@ Function *RuntimeBuilder::defineReadChar(Function *getc) {
     return f;
 }
 
-Function *RuntimeBuilder::defineWriteNumber() {
-    FunctionCallee printfF =
-        module.getOrInsertFunction("printf", FunctionType::get(i32, { ptr }, true));
-    Function *f = define("piet.write_number", FunctionType::get(voidTy, { i32 }, false));
-    Value *format = builder.CreateGlobalString("%d", "piet.int_format");
-    builder.CreateCall(printfF, { format, f->getArg(0) });
-    builder.CreateRetVoid();
-    return f;
-}
-
 Runtime RuntimeBuilder::build() {
     Runtime runtime;
     runtime.malloc = module.getOrInsertFunction("malloc", FunctionType::get(ptr, { i64 }, false));
     runtime.free = module.getOrInsertFunction("free", FunctionType::get(voidTy, { ptr }, false));
-    runtime.outOfMemory = defineOutOfMemory();
+
+    ArrayType *outTy = ArrayType::get(builder.getInt8Ty(), kOutputBufferSize);
+    outBuffer = new GlobalVariable(module, outTy, false, GlobalValue::InternalLinkage,
+                                   ConstantAggregateZero::get(outTy), "piet.out");
+    outLength = new GlobalVariable(module, i64, false, GlobalValue::InternalLinkage,
+                                   ConstantInt::get(i64, 0), "piet.out_length");
+    outLines = new GlobalVariable(module, builder.getInt1Ty(), false, GlobalValue::InternalLinkage,
+                                  builder.getFalse(), "piet.out_lines");
+    runtime.flush = flushF = defineFlush();
+    runtime.start = defineStart();
+    runtime.writeChar = defineWriteChar();
+    runtime.writeNumber = defineWriteNumber();
+
+    runtime.outOfMemory = defineOutOfMemory(flushF);
     runtime.grow = defineGrow(runtime.outOfMemory);
     runtime.roll = defineRoll(defineReverse());
 
-    runtime.putchar = module.getOrInsertFunction("putchar", FunctionType::get(i32, { i32 }, false));
-    fflushF = module.getOrInsertFunction("fflush", FunctionType::get(i32, { ptr }, false));
     Function *getc = defineGetc();
     runtime.readNumber = defineReadNumber(getc);
     runtime.readChar = defineReadChar(getc);
-    runtime.writeNumber = defineWriteNumber();
     return runtime;
 }
 
