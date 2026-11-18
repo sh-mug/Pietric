@@ -29,6 +29,11 @@ static_assert(kWindowSize <= kMaxTrackedDepth, "the window lives in the depth-tr
 // in generic copies.
 constexpr size_t kMaxTrackedCopies = 8192;
 constexpr size_t kMaxCachedCopies = 24576;
+// Generic copies live in functions of their own, this many each, which enter one another by
+// tail calls. In main, the generic code of a large program forms one huge loop, which loop and
+// value-range analyses take quadratic time on: opt took 322 s for 12,556 generic copies, and a
+// random 100x100 program, with 54,150, did not finish in half an hour.
+constexpr int kGenericGroupSize = 256;
 // Number of values the heap stack has room for before it first has to grow.
 constexpr int64_t kInitialStackCapacity = 1024;
 static_assert(kInitialStackCapacity > kMaxTrackedDepth, "spilling must not need to grow");
@@ -83,10 +88,29 @@ private:
     // position i (0 is the bottom, or the value just above the heap ones).
     std::vector<AllocaInst *> slots;
     // Heap stack: buffer[0..size) holds the values below the window, buffer[size - 1] being the
-    // highest of them.
-    AllocaInst *sizeSlot = nullptr;      // i64
-    AllocaInst *capacitySlot = nullptr;  // i64: how many values the buffer has room for
-    AllocaInst *bufferSlot = nullptr;    // ptr
+    // highest of them. The slots for these are allocas in main and globals in the functions
+    // of generic copies; sizeSlot, capacitySlot and bufferSlot are those of the code being
+    // emitted.
+    Value *sizeSlot = nullptr;      // i64
+    Value *capacitySlot = nullptr;  // i64: how many values the buffer has room for
+    Value *bufferSlot = nullptr;    // ptr
+    AllocaInst *sizeLocal = nullptr, *capacityLocal = nullptr, *bufferLocal = nullptr;
+    GlobalVariable *sizeGlobal = nullptr, *capacityGlobal = nullptr, *bufferGlobal = nullptr;
+    GlobalVariable *entryGlobal = nullptr;
+
+    // The functions of generic copies, each with a switch on the number in entryGlobal that
+    // leads to the copies other functions enter; and the function and entry number of each
+    // generic copy (-1 until another function enters it). The entry number is passed in a
+    // global, not an argument, so that interprocedural constant propagation does not try to
+    // specialize the functions for every entry, which takes most of opt's time.
+    std::vector<Function *> genericFunctions;
+    std::vector<SwitchInst *> genericEntries;
+    struct GenericCopy {
+        int function;
+        int entry;
+    };
+    std::map<int, GenericCopy> genericCopies;
+    Function *currentFunction() { return builder.GetInsertBlock()->getParent(); }
 
     // How the code being emitted keeps the stack, and the number of values in the slots (the
     // depth of a depth-tracked stack, or the size of the window; 0 in generic copies).
@@ -217,7 +241,27 @@ BasicBlock *CodeGen::copyOf(int node, int stateKey) {
     auto it = copies.find(key);
     if (it != copies.end())
         return it->second;
-    BasicBlock *bb = BasicBlock::Create(ctx, copyName(node, stateKey), mainFunc);
+    Function *function = mainFunc;
+    if (stateKey == kGenericKey) {
+        int group = genericCopies.size() / kGenericGroupSize;
+        if (group == static_cast<int>(genericFunctions.size())) {
+            // Inlining the functions into one another would build the huge function up again.
+            function = Function::Create(FunctionType::get(builder.getVoidTy(), false),
+                                        Function::InternalLinkage,
+                                        "piet.generic" + std::to_string(group), module);
+            function->addFnAttr(Attribute::NoInline);
+            function->addFnAttr(Attribute::NoUnwind);
+            BasicBlock *entryBB = BasicBlock::Create(ctx, "entry", function);
+            BasicBlock *noEntryBB = BasicBlock::Create(ctx, "no_entry", function);
+            new UnreachableInst(ctx, noEntryBB);
+            Value *entry = new LoadInst(i32, entryGlobal, "entry", entryBB);
+            genericEntries.push_back(SwitchInst::Create(entry, noEntryBB, 0, entryBB));
+            genericFunctions.push_back(function);
+        }
+        function = genericFunctions[group];
+        genericCopies[node] = { group, -1 };
+    }
+    BasicBlock *bb = BasicBlock::Create(ctx, copyName(node, stateKey), function);
     copies.emplace(key, bb);
     pending.push_back(key);
     if (stateKey >= kCachedKey)
@@ -235,7 +279,32 @@ void CodeGen::jump(int node) {
         moveToHeap(depth);
         mode = Mode::Generic;
     }
-    builder.CreateBr(copyOf(node, stateKey()));
+    BasicBlock *target = copyOf(node, stateKey());
+    if (target->getParent() == currentFunction()) {
+        builder.CreateBr(target);
+        return;
+    }
+    // A generic copy in another function. From main, hand the heap stack over in the globals
+    // and return when the program ends; from another function, tail-call, so that loops through
+    // several functions do not grow the call stack.
+    GenericCopy &copy = genericCopies[node];
+    SwitchInst *entries = genericEntries[copy.function];
+    if (copy.entry < 0) {
+        copy.entry = entries->getNumCases();
+        entries->addCase(constant(copy.entry), target);
+    }
+    Function *function = genericFunctions[copy.function];
+    builder.CreateStore(constant(copy.entry), entryGlobal);
+    if (currentFunction() == mainFunc) {
+        builder.CreateStore(builder.CreateLoad(i64, sizeLocal), sizeGlobal);
+        builder.CreateStore(builder.CreateLoad(i64, capacityLocal), capacityGlobal);
+        builder.CreateStore(builder.CreateLoad(ptr, bufferLocal), bufferGlobal);
+        builder.CreateCall(function);
+        builder.CreateRet(constant(0));
+    } else {
+        builder.CreateCall(function)->setTailCallKind(CallInst::TCK_MustTail);
+        builder.CreateRetVoid();
+    }
 }
 
 void CodeGen::enter(int node, int key) {
@@ -468,8 +537,8 @@ template <typename T, typename E> void CodeGen::emitBranch(Value *cond, T then, 
         restore(saved);
         return;
     }
-    BasicBlock *thenBB = BasicBlock::Create(ctx, "then", mainFunc);
-    BasicBlock *elseBB = BasicBlock::Create(ctx, "else", mainFunc);
+    BasicBlock *thenBB = BasicBlock::Create(ctx, "then", currentFunction());
+    BasicBlock *elseBB = BasicBlock::Create(ctx, "else", currentFunction());
     builder.CreateCondBr(cond, thenBB, elseBB);
     State saved = state();
     builder.SetInsertPoint(thenBB);
@@ -481,8 +550,8 @@ template <typename T, typename E> void CodeGen::emitBranch(Value *cond, T then, 
 }
 
 template <typename F> void CodeGen::emitIf(Value *cond, F then) {
-    BasicBlock *thenBB = BasicBlock::Create(ctx, "then", mainFunc);
-    BasicBlock *contBB = BasicBlock::Create(ctx, "cont", mainFunc);
+    BasicBlock *thenBB = BasicBlock::Create(ctx, "then", currentFunction());
+    BasicBlock *contBB = BasicBlock::Create(ctx, "cont", currentFunction());
     builder.CreateCondBr(cond, thenBB, contBB);
     builder.SetInsertPoint(thenBB);
     then();
@@ -653,9 +722,9 @@ void CodeGen::emitTrackedRoll(Value *rollDepth, Value *rolls) {
         rollSlots(0, rollDepth, rolls);
         return;
     }
-    BasicBlock *selectBB = BasicBlock::Create(ctx, "roll.select", mainFunc);
-    BasicBlock *memoryBB = BasicBlock::Create(ctx, "roll.memory", mainFunc);
-    BasicBlock *doneBB = BasicBlock::Create(ctx, "roll.done", mainFunc);
+    BasicBlock *selectBB = BasicBlock::Create(ctx, "roll.select", currentFunction());
+    BasicBlock *memoryBB = BasicBlock::Create(ctx, "roll.memory", currentFunction());
+    BasicBlock *doneBB = BasicBlock::Create(ctx, "roll.done", currentFunction());
     builder.CreateCondBr(builder.CreateICmpSLE(rollDepth, constant(kWindowSize)), selectBB,
                          memoryBB);
     std::vector<Value *> saved = known;
@@ -850,7 +919,7 @@ void CodeGen::emitPointerSwitch(const GraphNode &node) {
             std::vector<BasicBlock *> targets;
             State saved = state();
             for (int j = 0; j < numEdges; j++) {
-                targets.push_back(BasicBlock::Create(ctx, "case", mainFunc));
+                targets.push_back(BasicBlock::Create(ctx, "case", currentFunction()));
                 builder.SetInsertPoint(targets[j]);
                 jump(node.transitions[j].targetNode);
                 restore(saved);
@@ -869,7 +938,10 @@ void CodeGen::emitNode(const GraphNode &node) {
         builder.CreateCall(runtime.flush);
         if (!tracked())
             builder.CreateCall(runtime.free, { stackBuffer() });
-        builder.CreateRet(constant(0));
+        if (currentFunction() == mainFunc)
+            builder.CreateRet(constant(0));
+        else
+            builder.CreateRetVoid();
     } else if (node.transitions[0].command == Command::Pointer ||
                node.transitions[0].command == Command::Switch) {
         emitPointerSwitch(node);
@@ -894,9 +966,21 @@ void CodeGen::emit(const Graph &graph) {
 
     for (int i = 0; i < kMaxTrackedDepth; i++)
         slots.push_back(builder.CreateAlloca(i32, nullptr, "slot" + std::to_string(i)));
-    sizeSlot = builder.CreateAlloca(i64, nullptr, "size.slot");
-    capacitySlot = builder.CreateAlloca(i64, nullptr, "capacity.slot");
-    bufferSlot = builder.CreateAlloca(ptr, nullptr, "buffer.slot");
+    sizeLocal = builder.CreateAlloca(i64, nullptr, "size.slot");
+    capacityLocal = builder.CreateAlloca(i64, nullptr, "capacity.slot");
+    bufferLocal = builder.CreateAlloca(ptr, nullptr, "buffer.slot");
+    // External (but hidden) linkage keeps interprocedural constant propagation from tracking
+    // every store to these globals, which takes it long in large programs.
+    auto global = [&](Type *type, const char *name) {
+        auto *variable = new GlobalVariable(module, type, false, GlobalValue::ExternalLinkage,
+                                            Constant::getNullValue(type), name);
+        variable->setVisibility(GlobalValue::HiddenVisibility);
+        return variable;
+    };
+    sizeGlobal = global(i64, "piet.size");
+    capacityGlobal = global(i64, "piet.capacity");
+    bufferGlobal = global(ptr, "piet.buffer");
+    entryGlobal = global(i32, "piet.entry");
     rollScratch =
         builder.CreateAlloca(ArrayType::get(i32, kMaxTrackedDepth), nullptr, "roll.slots");
 
@@ -904,6 +988,7 @@ void CodeGen::emit(const Graph &graph) {
 
     builder.CreateCall(runtime.start);
     // Execution starts at node 0 with an empty stack.
+    sizeSlot = sizeLocal, capacitySlot = capacityLocal, bufferSlot = bufferLocal;
     enter(0, 0);
     jump(0);
 
@@ -911,6 +996,10 @@ void CodeGen::emit(const Graph &graph) {
         auto [nodeIndex, key] = pending.front();
         pending.pop_front();
         builder.SetInsertPoint(copies[{ nodeIndex, key }]);
+        bool inMain = key != kGenericKey;
+        sizeSlot = inMain ? static_cast<Value *>(sizeLocal) : sizeGlobal;
+        capacitySlot = inMain ? static_cast<Value *>(capacityLocal) : capacityGlobal;
+        bufferSlot = inMain ? static_cast<Value *>(bufferLocal) : bufferGlobal;
         enter(nodeIndex, key);
         emitNode(nodes[nodeIndex]);
     }
