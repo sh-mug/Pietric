@@ -183,6 +183,8 @@ private:
     void emitTrackedRoll(Value *rollDepth, Value *rolls);
     // Rolls within slots[first..depth) (rollDepth <= depth - first) with selects.
     void rollSlots(int first, Value *rollDepth, Value *rolls);
+    // Room for the slots, for rolls done in memory.
+    AllocaInst *rollScratch = nullptr;
     // Emits an input command: calls `readF` and pushes the value if one was read.
     void emitInput(Function *readF, int next);
     // Emits a pointer or switch command, which picks the successor.
@@ -641,11 +643,42 @@ void CodeGen::emitHeapRoll(Value *rollDepth, Value *rolls) {
 
 // The values stay in SSA form. A roll by known values renames slots; otherwise every slot
 // gets a select between the old values, picked by arithmetic on rollDepth and rolls, which
-// folds away if they become known later.
+// folds away if they become known later. As that takes a select for every pair of slots, a
+// roll that may be deeper than kWindowSize selects only within the top kWindowSize slots and
+// rolls deeper stacks in memory.
 void CodeGen::emitTrackedRoll(Value *rollDepth, Value *rolls) {
     if (depth < 2)
         return;
-    rollSlots(0, rollDepth, rolls);
+    if (isa<ConstantInt>(rollDepth) || depth <= kWindowSize) {
+        rollSlots(0, rollDepth, rolls);
+        return;
+    }
+    BasicBlock *selectBB = BasicBlock::Create(ctx, "roll.select", mainFunc);
+    BasicBlock *memoryBB = BasicBlock::Create(ctx, "roll.memory", mainFunc);
+    BasicBlock *doneBB = BasicBlock::Create(ctx, "roll.done", mainFunc);
+    builder.CreateCondBr(builder.CreateICmpSLE(rollDepth, constant(kWindowSize)), selectBB,
+                         memoryBB);
+    std::vector<Value *> saved = known;
+
+    builder.SetInsertPoint(selectBB);
+    rollSlots(depth - kWindowSize, rollDepth, rolls);
+    builder.CreateBr(doneBB);
+
+    builder.SetInsertPoint(memoryBB);
+    known = saved;
+    for (int i = 0; i < depth; i++)
+        builder.CreateStore(getSlot(i), builder.CreateConstInBoundsGEP1_64(i32, rollScratch, i));
+    Value *base = builder.CreateInBoundsGEP(
+        i32, rollScratch, builder.CreateSub(index(depth), builder.CreateSExt(rollDepth, i64)));
+    builder.CreateCall(runtime.roll, { base, rollDepth, rolls });
+    for (int i = 0; i < depth; i++)
+        setSlot(i,
+                builder.CreateLoad(i32, builder.CreateConstInBoundsGEP1_64(i32, rollScratch, i)));
+    builder.CreateBr(doneBB);
+
+    // The slots differ between the two ways; load them again.
+    builder.SetInsertPoint(doneBB);
+    std::fill(known.begin(), known.end(), nullptr);
 }
 
 void CodeGen::rollSlots(int first, Value *rollDepth, Value *rolls) {
@@ -864,6 +897,8 @@ void CodeGen::emit(const Graph &graph) {
     sizeSlot = builder.CreateAlloca(i64, nullptr, "size.slot");
     capacitySlot = builder.CreateAlloca(i64, nullptr, "capacity.slot");
     bufferSlot = builder.CreateAlloca(ptr, nullptr, "buffer.slot");
+    rollScratch =
+        builder.CreateAlloca(ArrayType::get(i32, kMaxTrackedDepth), nullptr, "roll.slots");
 
     analyzeKnownTops(nodes);
 
