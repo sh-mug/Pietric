@@ -164,15 +164,18 @@ Function *RuntimeBuilder::defineRoll(Function *reverse) {
     // Rolling fewer than two values changes nothing (and depth 0 cannot be divided by).
     builder.CreateCondBr(builder.CreateICmpSLT(depth, builder.getInt32(2)), doneBB, byOneBB);
 
-    // Rolls by 1 and -1 are the most common. They move one value past the others, which needs
-    // neither the division below nor the buffer.
+    // Rolls by 1 and -1 are the most common (also written as by 1 - n and n - 1). They move one
+    // value past the others, which needs neither the division below nor the buffer.
     builder.SetInsertPoint(byOneBB);
     const Align align(sizeof(int32_t));
     Value *last = builder.CreateSub(builder.CreateZExt(depth, i64), ConstantInt::get(i64, 1));
     Value *lastAt = builder.CreateInBoundsGEP(i32, base, last);
     Value *secondAt = builder.CreateConstInBoundsGEP1_64(i32, base, 1);
     Value *othersBytes = builder.CreateMul(last, ConstantInt::get(i64, sizeof(int32_t)));
-    builder.CreateCondBr(builder.CreateICmpEQ(rolls, builder.getInt32(1)), downBB, byMinusOneBB);
+    Value *byOne = builder.CreateOr(
+        builder.CreateICmpEQ(rolls, builder.getInt32(1)),
+        builder.CreateICmpEQ(rolls, builder.CreateSub(builder.getInt32(1), depth)));
+    builder.CreateCondBr(byOne, downBB, byMinusOneBB);
 
     // By 1: the top value goes to the bottom.
     builder.SetInsertPoint(downBB);
@@ -183,7 +186,10 @@ Function *RuntimeBuilder::defineRoll(Function *reverse) {
 
     // By -1: the bottom value goes to the top.
     builder.SetInsertPoint(byMinusOneBB);
-    builder.CreateCondBr(builder.CreateICmpEQ(rolls, builder.getInt32(-1)), upBB, normalizeBB);
+    Value *byMinusOne = builder.CreateOr(
+        builder.CreateICmpEQ(rolls, builder.getInt32(-1)),
+        builder.CreateICmpEQ(rolls, builder.CreateSub(depth, builder.getInt32(1))));
+    builder.CreateCondBr(byMinusOne, upBB, normalizeBB);
     builder.SetInsertPoint(upBB);
     Value *bottom = builder.CreateLoad(i32, base);
     builder.CreateMemMove(base, align, secondAt, align, othersBytes);
