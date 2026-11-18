@@ -18,8 +18,11 @@ constexpr int kMaxTrackedDepth = 16;
 // those where input fails), so a larger window costs compile time: 16 makes small programs take
 // about 1.6 times as long to compile, while 4 is too small for the loop of a typical program.
 constexpr int kWindowSize = 8;
-// How many values a full window moves to the heap at once.
-constexpr int kEvictCount = kWindowSize / 2;
+// How many values a full window moves to the heap at once. Moving more makes the window run
+// empty sooner, and the values come back one by one: with 4, the BF interpreter among the
+// PietCC samples spent most of its time moving values between the window and the heap.
+constexpr int kEvictCount = 2;
+static_assert(kEvictCount <= kWindowSize, "a full window must hold the values it moves");
 static_assert(kWindowSize <= kMaxTrackedDepth, "the window lives in the depth-tracked slots");
 // Upper bounds on the number of depth-tracked and of cached node copies, which keep the code size
 // of large programs in check. Copies are created breadth-first from the start, so depth-tracked
