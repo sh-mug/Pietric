@@ -157,8 +157,38 @@ Function *RuntimeBuilder::defineRoll(Function *reverse) {
     Value *buffer =
         builder.CreateAlloca(ArrayType::get(i32, kRollBufferSize), nullptr, "buffer");
 
+    BasicBlock *byOneBB = BasicBlock::Create(ctx, "by_one", f, normalizeBB);
+    BasicBlock *downBB = BasicBlock::Create(ctx, "top_down", f, normalizeBB);
+    BasicBlock *byMinusOneBB = BasicBlock::Create(ctx, "by_minus_one", f, normalizeBB);
+    BasicBlock *upBB = BasicBlock::Create(ctx, "bottom_up", f, normalizeBB);
     // Rolling fewer than two values changes nothing (and depth 0 cannot be divided by).
-    builder.CreateCondBr(builder.CreateICmpSLT(depth, builder.getInt32(2)), doneBB, normalizeBB);
+    builder.CreateCondBr(builder.CreateICmpSLT(depth, builder.getInt32(2)), doneBB, byOneBB);
+
+    // Rolls by 1 and -1 are the most common. They move one value past the others, which needs
+    // neither the division below nor the buffer.
+    builder.SetInsertPoint(byOneBB);
+    const Align align(sizeof(int32_t));
+    Value *last = builder.CreateSub(builder.CreateZExt(depth, i64), ConstantInt::get(i64, 1));
+    Value *lastAt = builder.CreateInBoundsGEP(i32, base, last);
+    Value *secondAt = builder.CreateConstInBoundsGEP1_64(i32, base, 1);
+    Value *othersBytes = builder.CreateMul(last, ConstantInt::get(i64, sizeof(int32_t)));
+    builder.CreateCondBr(builder.CreateICmpEQ(rolls, builder.getInt32(1)), downBB, byMinusOneBB);
+
+    // By 1: the top value goes to the bottom.
+    builder.SetInsertPoint(downBB);
+    Value *top = builder.CreateLoad(i32, lastAt);
+    builder.CreateMemMove(secondAt, align, base, align, othersBytes);
+    builder.CreateStore(top, base);
+    builder.CreateBr(doneBB);
+
+    // By -1: the bottom value goes to the top.
+    builder.SetInsertPoint(byMinusOneBB);
+    builder.CreateCondBr(builder.CreateICmpEQ(rolls, builder.getInt32(-1)), upBB, normalizeBB);
+    builder.SetInsertPoint(upBB);
+    Value *bottom = builder.CreateLoad(i32, base);
+    builder.CreateMemMove(base, align, secondAt, align, othersBytes);
+    builder.CreateStore(bottom, lastAt);
+    builder.CreateBr(doneBB);
 
     // A roll of depth n by r moves every value r places towards the top, wrapping round, so
     // only r mod n (rounded towards negative infinity, in 0..n-1) matters.
@@ -182,7 +212,6 @@ Function *RuntimeBuilder::defineRoll(Function *reverse) {
     BasicBlock *reverseBB = BasicBlock::Create(ctx, "reverse", f, doneBB);
     builder.CreateCondBr(builder.CreateICmpULE(k, bufferSize), shortTopBB, checkBottomBB);
 
-    const Align align(sizeof(int32_t));
     auto bytes = [&](Value *count) {
         return builder.CreateMul(count, ConstantInt::get(i64, sizeof(int32_t)));
     };
