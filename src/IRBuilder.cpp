@@ -92,18 +92,35 @@ private:
     // depth of a depth-tracked stack, or the size of the window; 0 in generic copies).
     Mode mode = Mode::Tracked;
     int depth = 0;
+    // The values in the slots, where known in the code being emitted (else null): values are
+    // reused instead of loaded again, and a copy starts with the constants that knownTops
+    // finds at the top of the stack, so that a roll by pushed constants becomes a renaming of
+    // slots and branches on constants need only one side.
+    std::vector<Value *> known;
     struct State {
         Mode mode;
         int depth;
+        std::vector<Value *> known;
     };
-    State state() const { return { mode, depth }; }
-    void restore(State saved) { mode = saved.mode; depth = saved.depth; }
+    State state() const { return { mode, depth, known }; }
+    void restore(State saved) {
+        mode = saved.mode;
+        depth = saved.depth;
+        known = std::move(saved.known);
+    }
     int stateKey() const;
+    // Sets the state for the copy of `node` with state key `key`.
+    void enter(int node, int key);
 
     // Node copies, keyed by (node index, state key), and the ones still to be emitted.
     std::map<std::pair<int, int>, BasicBlock *> copies;
     std::deque<std::pair<int, int>> pending;
     size_t trackedCopies = 0, cachedCopies = 0;
+
+    // For every node, the values that are at the top of the stack whenever it is entered, top
+    // first, and the analysis that finds them.
+    std::vector<std::vector<int32_t>> knownTops;
+    void analyzeKnownTops(const std::vector<GraphNode> &nodes);
 
     ConstantInt *constant(int value) { return ConstantInt::get(i32, value); }
     ConstantInt *index(int64_t value) { return ConstantInt::get(i64, value); }
@@ -113,6 +130,7 @@ private:
 
     // Returns the block of the copy of `node` for the state `key`, creating it if needed.
     BasicBlock *copyOf(int node, int key);
+    std::string copyName(int node, int key) const;
     // Ends the current block with a branch to the copy of `node` for the current state. If that
     // would need a depth-tracked copy beyond kMaxTrackedCopies, spills first; if it would need a
     // cached copy beyond kMaxCachedCopies, moves the window to the heap and continues
@@ -120,6 +138,9 @@ private:
     void jump(int node);
 
     // --- Stack operations, for every kind of copy ---
+    // Reads and writes slot i.
+    Value *getSlot(int i);
+    void setSlot(int i, Value *value);
     // The number of values on the stack, as an i64.
     Value *stackSize();
     // Pops the top value. The stack must not be empty, and in a cached copy the window must
@@ -158,8 +179,10 @@ private:
     template <typename F> void emitBinary(F op, int next);
     void emitDivMod(Command cmd, int next);
     void emitRoll(int next);
-    // Rolls the top `rollDepth` values (0 <= rollDepth <= depth) of the depth-tracked stack.
+    // Rolls the top `rollDepth` values (0 <= rollDepth <= depth) of the slots.
     void emitTrackedRoll(Value *rollDepth, Value *rolls);
+    // Rolls within slots[first..depth) (rollDepth <= depth - first) with selects.
+    void rollSlots(int first, Value *rollDepth, Value *rolls);
     // Emits an input command: calls `readF` and pushes the value if one was read.
     void emitInput(Function *readF, int next);
     // Emits a pointer or switch command, which picks the successor.
@@ -180,16 +203,19 @@ int CodeGen::stateKey() const {
     return kGenericKey;
 }
 
+std::string CodeGen::copyName(int node, int stateKey) const {
+    return "node" + std::to_string(node) +
+           (stateKey == kGenericKey ? ".g"
+            : stateKey >= kCachedKey ? ".c" + std::to_string(stateKey - kCachedKey)
+                                     : ".d" + std::to_string(stateKey));
+}
+
 BasicBlock *CodeGen::copyOf(int node, int stateKey) {
     auto key = std::make_pair(node, stateKey);
     auto it = copies.find(key);
     if (it != copies.end())
         return it->second;
-    std::string name = "node" + std::to_string(node) +
-                       (stateKey == kGenericKey ? ".g"
-                        : stateKey >= kCachedKey ? ".c" + std::to_string(stateKey - kCachedKey)
-                                                 : ".d" + std::to_string(stateKey));
-    BasicBlock *bb = BasicBlock::Create(ctx, name, mainFunc);
+    BasicBlock *bb = BasicBlock::Create(ctx, copyName(node, stateKey), mainFunc);
     copies.emplace(key, bb);
     pending.push_back(key);
     if (stateKey >= kCachedKey)
@@ -200,13 +226,145 @@ BasicBlock *CodeGen::copyOf(int node, int stateKey) {
 }
 
 void CodeGen::jump(int node) {
-    if (tracked() && !copies.count({ node, stateKey() }) && trackedCopies >= kMaxTrackedCopies)
+    auto isNew = [&] { return !copies.count({ node, stateKey() }); };
+    if (tracked() && isNew() && trackedCopies >= kMaxTrackedCopies)
         spill();
-    if (cached() && !copies.count({ node, stateKey() }) && cachedCopies >= kMaxCachedCopies) {
+    if (cached() && isNew() && cachedCopies >= kMaxCachedCopies) {
         moveToHeap(depth);
         mode = Mode::Generic;
     }
     builder.CreateBr(copyOf(node, stateKey()));
+}
+
+void CodeGen::enter(int node, int key) {
+    if (key == kGenericKey)
+        mode = Mode::Generic, depth = 0;
+    else if (key >= kCachedKey)
+        mode = Mode::Cached, depth = key - kCachedKey;
+    else
+        mode = Mode::Tracked, depth = key;
+    known.assign(kMaxTrackedDepth, nullptr);
+    const std::vector<int32_t> &tops = knownTops[node];
+    for (int i = 0; i < depth && i < static_cast<int>(tops.size()); i++)
+        known[depth - 1 - i] = constant(tops[i]);
+}
+
+// The effect of a command on the known values at the top of the stack (top first): what is
+// known after it, given what is known before. A command whose effect depends on values that
+// are not known, or that can fail and leave the stack in another shape, leaves nothing known.
+std::vector<int32_t> knownTopsAfter(Command cmd, int blockSize, const std::vector<int32_t> &in) {
+    auto rest = [&](size_t count) { return std::vector<int32_t>(in.begin() + count, in.end()); };
+    auto with = [](int32_t value, std::vector<int32_t> below) {
+        below.insert(below.begin(), value);
+        return below;
+    };
+    auto wrap = [](uint32_t value) { return static_cast<int32_t>(value); };
+    if (cmd == Command::Push)
+        return with(blockSize, in);
+    if (cmd == Command::None)
+        return in;
+    if (in.empty())
+        return {};
+    int32_t top = in[0];
+    switch (cmd) {
+        case Command::Pop:
+        case Command::OutputNum:
+        case Command::OutputChar:
+            return rest(1);
+        case Command::Not:
+            return with(top == 0, rest(1));
+        case Command::Duplicate:
+            return with(top, in);
+        default:
+            break;
+    }
+    if (in.size() < 2)
+        return {};
+    int32_t second = in[1];
+    uint32_t a = static_cast<uint32_t>(second), b = static_cast<uint32_t>(top);
+    switch (cmd) {
+        case Command::Add:
+            return with(wrap(a + b), rest(2));
+        case Command::Subtract:
+            return with(wrap(a - b), rest(2));
+        case Command::Multiply:
+            return with(wrap(a * b), rest(2));
+        case Command::Greater:
+            return with(second > top, rest(2));
+        case Command::Divide:
+            if (top == 0)
+                return {};
+            return with(top == -1 ? wrap(0u - a) : second / top, rest(2));
+        case Command::Modulo: {
+            if (top == 0)
+                return {};
+            int32_t rem = top == -1 ? 0 : second % top;
+            if (rem != 0 && (rem ^ top) < 0)
+                rem += top;
+            return with(rem, rest(2));
+        }
+        default:
+            return {};  // roll, input
+    }
+}
+
+// A forward analysis over the graph: the known values on entry to a node are those that every
+// way into it leaves there. A pointer or switch whose value is known takes only one way out.
+void CodeGen::analyzeKnownTops(const std::vector<GraphNode> &nodes) {
+    constexpr size_t kMaxKnown = kMaxTrackedDepth;
+    std::vector<bool> reached(nodes.size(), false);
+    knownTops.assign(nodes.size(), {});
+    std::deque<int> work;
+    auto flow = [&](int target, std::vector<int32_t> tops) {
+        if (tops.size() > kMaxKnown)
+            tops.resize(kMaxKnown);
+        std::vector<int32_t> &current = knownTops[target];
+        if (!reached[target]) {
+            reached[target] = true;
+            current = std::move(tops);
+            work.push_back(target);
+            return;
+        }
+        size_t common = 0;
+        while (common < current.size() && common < tops.size() && current[common] == tops[common])
+            common++;
+        if (common < current.size()) {
+            current.resize(common);
+            work.push_back(target);
+        }
+    };
+    flow(0, {});
+    while (!work.empty()) {
+        const GraphNode &node = nodes[work.front()];
+        std::vector<int32_t> in = knownTops[work.front()];
+        work.pop_front();
+        if (node.transitions.empty())
+            continue;
+        Command cmd = node.transitions[0].command;
+        if (cmd != Command::Pointer && cmd != Command::Switch) {
+            flow(node.transitions[0].targetNode, knownTopsAfter(cmd, node.blockSize, in));
+            continue;
+        }
+        if (in.empty()) {
+            for (const GraphEdge &edge : node.transitions)
+                flow(edge.targetNode, {});
+            continue;
+        }
+        int32_t value = in[0];
+        int way = cmd == Command::Pointer ? ((value % 4) + 4) % 4 : (value % 2 != 0);
+        flow(node.transitions[way].targetNode, std::vector<int32_t>(in.begin() + 1, in.end()));
+    }
+}
+
+Value *CodeGen::getSlot(int i) {
+    if (!known[i])
+        known[i] = builder.CreateLoad(i32, slots[i]);
+    return known[i];
+}
+
+void CodeGen::setSlot(int i, Value *value) {
+    builder.CreateStore(value, slots[i]);
+    known[i] = value;
 }
 
 Value *CodeGen::stackSize() {
@@ -220,7 +378,7 @@ Value *CodeGen::pop() {
     if (!generic()) {
         assert(depth > 0);
         depth--;
-        return builder.CreateLoad(i32, slots[depth]);
+        return getSlot(depth);
     }
     // The callers check the size first, so it cannot wrap.
     Value *newSize = builder.CreateNUWSub(stackSize(), index(1));
@@ -234,7 +392,7 @@ void CodeGen::push(Value *value) {
     else if (cached() && depth == kWindowSize)
         moveToHeap(kEvictCount);
     if (!generic()) {
-        builder.CreateStore(value, slots[depth]);
+        setSlot(depth, value);
         depth++;
         return;
     }
@@ -275,11 +433,10 @@ void CodeGen::moveToHeap(int count) {
     reserve(size, count);
     Value *buffer = stackBuffer();
     for (int i = 0; i < count; i++)
-        builder.CreateStore(builder.CreateLoad(i32, slots[i]),
-                            builder.CreateInBoundsGEP(i32, buffer,
-                                                      builder.CreateNUWAdd(size, index(i))));
+        builder.CreateStore(getSlot(i), builder.CreateInBoundsGEP(
+                                            i32, buffer, builder.CreateNUWAdd(size, index(i))));
     for (int i = count; i < depth; i++)
-        builder.CreateStore(builder.CreateLoad(i32, slots[i]), slots[i - count]);
+        setSlot(i - count, getSlot(i));
     builder.CreateStore(builder.CreateNUWAdd(size, index(count)), sizeSlot);
     depth -= count;
 }
@@ -287,19 +444,28 @@ void CodeGen::moveToHeap(int count) {
 void CodeGen::refill(int count) {
     assert(cached() && depth + count <= kWindowSize);
     for (int i = depth - 1; i >= 0; i--)
-        builder.CreateStore(builder.CreateLoad(i32, slots[i]), slots[i + count]);
+        setSlot(i + count, getSlot(i));
     Value *size = builder.CreateNUWSub(builder.CreateLoad(i64, sizeSlot, "size"), index(count));
     Value *buffer = stackBuffer();
     for (int i = 0; i < count; i++)
-        builder.CreateStore(
-            builder.CreateLoad(i32, builder.CreateInBoundsGEP(
-                                        i32, buffer, builder.CreateNUWAdd(size, index(i)))),
-            slots[i]);
+        setSlot(i, builder.CreateLoad(
+                       i32, builder.CreateInBoundsGEP(i32, buffer,
+                                                      builder.CreateNUWAdd(size, index(i)))));
     builder.CreateStore(size, sizeSlot);
     depth += count;
 }
 
 template <typename T, typename E> void CodeGen::emitBranch(Value *cond, T then, E otherwise) {
+    if (auto *fixed = dyn_cast<ConstantInt>(cond)) {
+        // Known at compile time: only one side can run.
+        State saved = state();
+        if (fixed->isOne())
+            then();
+        else
+            otherwise();
+        restore(saved);
+        return;
+    }
     BasicBlock *thenBB = BasicBlock::Create(ctx, "then", mainFunc);
     BasicBlock *elseBB = BasicBlock::Create(ctx, "else", mainFunc);
     builder.CreateCondBr(cond, thenBB, elseBB);
@@ -403,6 +569,10 @@ void CodeGen::emitRoll(int next) {
             Value *wideDepth = builder.CreateSExt(rollDepth, i64);
             Value *valid = builder.CreateAnd(builder.CreateICmpSGE(rollDepth, constant(0)),
                                              builder.CreateICmpSLE(wideDepth, size));
+            // A known depth that the window holds is valid whatever the heap holds.
+            if (auto *knownDepth = dyn_cast<ConstantInt>(rollDepth); knownDepth && cached())
+                if (knownDepth->getSExtValue() >= 0 && knownDepth->getSExtValue() <= depth)
+                    valid = builder.getTrue();
             emitBranch(valid,
                 [&] {
                     if (cached()) {
@@ -444,10 +614,15 @@ void CodeGen::emitCachedRoll(Value *rollDepth, Value *rolls, int next) {
             onHeap();
             return;
         }
+        Value *fitsWindow = builder.CreateICmpSLE(rollDepth, constant(kWindowSize));
+        if (auto *fixed = dyn_cast<ConstantInt>(fitsWindow); fixed && fixed->isZero()) {
+            onHeap();
+            return;
+        }
         int missing = kWindowSize - depth;
         Value *heapSize = builder.CreateLoad(i64, sizeSlot, "size");
-        Value *fits = builder.CreateAnd(builder.CreateICmpSLE(rollDepth, constant(kWindowSize)),
-                                        builder.CreateICmpSGE(heapSize, index(missing)));
+        Value *fits =
+            builder.CreateAnd(fitsWindow, builder.CreateICmpSGE(heapSize, index(missing)));
         emitBranch(fits,
             [&] {
                 refill(missing);
@@ -464,14 +639,20 @@ void CodeGen::emitHeapRoll(Value *rollDepth, Value *rolls) {
     builder.CreateCall(runtime.roll, { base, rollDepth, rolls });
 }
 
-// The values stay in SSA form: every slot gets a select between the old values, picked by
-// arithmetic on rollDepth and rolls, which folds away once those are known.
+// The values stay in SSA form. A roll by known values renames slots; otherwise every slot
+// gets a select between the old values, picked by arithmetic on rollDepth and rolls, which
+// folds away if they become known later.
 void CodeGen::emitTrackedRoll(Value *rollDepth, Value *rolls) {
     if (depth < 2)
         return;
+    rollSlots(0, rollDepth, rolls);
+}
+
+void CodeGen::rollSlots(int first, Value *rollDepth, Value *rolls) {
+    int width = depth - first;
     std::vector<Value *> old;
-    for (int i = 0; i < depth; i++)
-        old.push_back(builder.CreateLoad(i32, slots[i]));
+    for (int i = first; i < depth; i++)
+        old.push_back(getSlot(i));
 
     // A roll of depth n by r moves every value r places towards the top, wrapping round, so
     // only r mod n (rounded towards negative infinity, in 0..n-1) matters. Depths 0 and 1
@@ -481,10 +662,11 @@ void CodeGen::emitTrackedRoll(Value *rollDepth, Value *rolls) {
     Value *rem = builder.CreateSRem(rolls, n);
     Value *r = builder.CreateSelect(builder.CreateICmpSLT(rem, constant(0)),
                                     builder.CreateAdd(rem, n), rem);
-    Value *base = builder.CreateSub(constant(depth), rollDepth);  // first rolled position
+    // The first rolled position, counted from `first`.
+    Value *base = builder.CreateSub(constant(width), rollDepth);
 
     std::vector<Value *> rolled;
-    for (int i = 0; i < depth; i++) {
+    for (int i = 0; i < width; i++) {
         // Position i receives the value from position base + ((i - base - r) mod n), if it is
         // among the rolled values.
         Value *offset = builder.CreateSub(constant(i), base);
@@ -493,13 +675,20 @@ void CodeGen::emitTrackedRoll(Value *rollDepth, Value *rolls) {
                                     builder.CreateAdd(from, n), from);
         Value *source = builder.CreateSelect(builder.CreateICmpSGE(offset, constant(0)),
                                              builder.CreateAdd(base, from), constant(i));
-        Value *value = old[depth - 1];
-        for (int j = depth - 2; j >= 0; j--)
+        if (auto *knownSource = dyn_cast<ConstantInt>(source)) {
+            // rollDepth and rolls are known: the roll renames slots. (A source outside the
+            // stack means that rollDepth is out of range, on a path that is never taken.)
+            uint64_t from = knownSource->getZExtValue();
+            rolled.push_back(from < old.size() ? old[from] : old[i]);
+            continue;
+        }
+        Value *value = old[width - 1];
+        for (int j = width - 2; j >= 0; j--)
             value = builder.CreateSelect(builder.CreateICmpEQ(source, constant(j)), old[j], value);
         rolled.push_back(value);
     }
-    for (int i = 0; i < depth; i++)
-        builder.CreateStore(rolled[i], slots[i]);
+    for (int i = 0; i < width; i++)
+        setSlot(first + i, rolled[i]);
 }
 
 void CodeGen::emitInput(Function *readF, int next) {
@@ -618,6 +807,10 @@ void CodeGen::emitPointerSwitch(const GraphNode &node) {
                 Value *rem = builder.CreateSRem(value, constant(2));
                 index = builder.CreateZExt(builder.CreateICmpNE(rem, constant(0)), i32);
             }
+            if (auto *knownIndex = dyn_cast<ConstantInt>(index)) {
+                jump(node.transitions[knownIndex->getZExtValue()].targetNode);
+                return;
+            }
             // Each successor gets its own block, so that a copy whose depth-tracked budget
             // runs out can spill on the way.
             BasicBlock *switchBB = builder.GetInsertBlock();
@@ -672,21 +865,18 @@ void CodeGen::emit(const Graph &graph) {
     capacitySlot = builder.CreateAlloca(i64, nullptr, "capacity.slot");
     bufferSlot = builder.CreateAlloca(ptr, nullptr, "buffer.slot");
 
+    analyzeKnownTops(nodes);
+
     builder.CreateCall(runtime.start);
     // Execution starts at node 0 with an empty stack.
-    restore({ Mode::Tracked, 0 });
+    enter(0, 0);
     jump(0);
 
     while (!pending.empty()) {
         auto [nodeIndex, key] = pending.front();
         pending.pop_front();
         builder.SetInsertPoint(copies[{ nodeIndex, key }]);
-        if (key == kGenericKey)
-            restore({ Mode::Generic, 0 });
-        else if (key >= kCachedKey)
-            restore({ Mode::Cached, key - kCachedKey });
-        else
-            restore({ Mode::Tracked, key });
+        enter(nodeIndex, key);
         emitNode(nodes[nodeIndex]);
     }
 }
