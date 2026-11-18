@@ -1,6 +1,12 @@
 # Ignore build artifacts
 /build/
 
+# Downloads and results of bench/run.py
+/bench-work/
+
+# Python caches
+__pycache__/
+
 # CMake generated files
 CMakeCache.txt
 CMakeFiles/
