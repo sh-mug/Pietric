@@ -138,6 +138,9 @@ private:
     void reserve(Value *size, int count);
     // Rolls the top rollDepth values of the heap stack (the window must be empty).
     void emitHeapRoll(Value *rollDepth, Value *rolls);
+    // Emits a valid roll (0 <= rollDepth <= size) in a cached copy, followed by the branch to
+    // `next`.
+    void emitCachedRoll(Value *rollDepth, Value *rolls, int next);
     Value *stackBuffer() { return builder.CreateLoad(ptr, bufferSlot, "buffer"); }
 
     // Emits `if (cond) then(); else otherwise();`. Both must end the block they emit into (as
@@ -403,18 +406,7 @@ void CodeGen::emitRoll(int next) {
             emitBranch(valid,
                 [&] {
                     if (cached()) {
-                        // Roll within the window if it holds the values to roll, else on the
-                        // heap.
-                        emitBranch(builder.CreateICmpSLE(rollDepth, constant(depth)),
-                            [&] {
-                                emitTrackedRoll(rollDepth, rolls);
-                                jump(next);
-                            },
-                            [&] {
-                                moveToHeap(depth);
-                                emitHeapRoll(rollDepth, rolls);
-                                jump(next);
-                            });
+                        emitCachedRoll(rollDepth, rolls, next);
                         return;
                     }
                     if (generic())
@@ -430,6 +422,39 @@ void CodeGen::emitRoll(int next) {
                 });
         },
         [&] { jump(next); });
+}
+
+// Rolls within the window if it holds the values to roll. Else, if a full window would hold
+// them and the heap has the values to fill it, fills it and rolls within it: rolls of a few
+// values whose depth is only known at run time are common, and the window may hold fewer
+// values than they need because pops refill it only one value at a time. Else rolls on the
+// heap.
+void CodeGen::emitCachedRoll(Value *rollDepth, Value *rolls, int next) {
+    auto inWindow = [&] {
+        emitTrackedRoll(rollDepth, rolls);
+        jump(next);
+    };
+    auto onHeap = [&] {
+        moveToHeap(depth);
+        emitHeapRoll(rollDepth, rolls);
+        jump(next);
+    };
+    emitBranch(builder.CreateICmpSLE(rollDepth, constant(depth)), inWindow, [&] {
+        if (depth == kWindowSize) {
+            onHeap();
+            return;
+        }
+        int missing = kWindowSize - depth;
+        Value *heapSize = builder.CreateLoad(i64, sizeSlot, "size");
+        Value *fits = builder.CreateAnd(builder.CreateICmpSLE(rollDepth, constant(kWindowSize)),
+                                        builder.CreateICmpSGE(heapSize, index(missing)));
+        emitBranch(fits,
+            [&] {
+                refill(missing);
+                inWindow();
+            },
+            onHeap);
+    });
 }
 
 void CodeGen::emitHeapRoll(Value *rollDepth, Value *rolls) {
