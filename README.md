@@ -4,9 +4,16 @@ English | [日本語](README.ja.md)
 
 **The fastest compiler for Piet**: programs run 5–130× faster than with [PietCC](https://github.com/pwang00/pietcc) and 150–4,900× faster than with the [npiet](https://www.bertnase.de/npiet/) interpreter ([benchmarks](bench/README.md)).
 
+![A Piet program compiled and run with Pietric](docs/demo.gif)
+
 Pietric is a C++-centric compiler for the Piet programming language. Piet is an esoteric, stack-based language where programs are painted as abstract images. This compiler uses LLVM IR as its intermediate representation and then generates machine code. The Piet stack and I/O are implemented directly in the generated IR, so LLVM's optimizer can see through every operation, and the resulting program needs nothing but the C library (with the POSIX functions `write` and `isatty`).
 
 ## Performance
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmark-dark.svg">
+  <img alt="Run times of a Brainfuck interpreter written in Piet" src="docs/benchmark-light.svg">
+</picture>
 
 Each row below is one Piet program with the same input for every implementation; times are in seconds, lower is better. [bench/README.md](bench/README.md) has the results of all the benchmarks.
 
@@ -21,6 +28,20 @@ Each row below is one Piet program with the same input for every implementation;
 Pietric and PietCC are compilers (the times are those of the compiled programs); [npiet](https://www.bertnase.de/npiet/), [rpiet](https://github.com/tessi/rpiet) and [piet_programming_language](https://github.com/your-diary/piet_programming_language) are interpreters. † PietCC without optimization: with `--o2` it did not finish compiling in 30 minutes. Runs were stopped after 600 s. Measured on an Intel Core i5-12400; see [bench/README.md](bench/README.md) for the details and for how to run them yourself.
 
 ## Building the Compiler
+
+### With Docker
+
+The Docker image comes with LLVM 20. Build it, then compile and run a program in the current directory:
+```bash
+docker build -t pietric .
+docker run --rm -i -v "$PWD:/work" pietric run program.png
+```
+or only compile it (the executable runs on Linux):
+```bash
+docker run --rm -v "$PWD:/work" -u "$(id -u):$(id -g)" pietric program.png -o program
+```
+
+### From Source
 
 > [!NOTE]
 > Make sure that the environment variable `LLVM_DIR` is set to the directory where your LLVM installation's configuration files reside. This is required by CMake to locate LLVM properly.
@@ -111,6 +132,7 @@ End-to-end tests compile the programs in `tests/cases/`, run them and check thei
 ```
 Pietric/
 ├── CMakeLists.txt         # CMake build configuration file
+├── Dockerfile             # Docker image with Pietric and LLVM 20
 ├── README.md              # This documentation file
 ├── README.ja.md           # This documentation in Japanese
 ├── .gitignore             # Files/directories ignored by git
@@ -136,10 +158,13 @@ Pietric/
 │   ├── gen_cases.py    # Generates the text-format test programs in cases/
 │   ├── cases/          # Test programs with their expected output (and input)
 │   └── README.md       # How to run and add tests
-└── bench/
-    ├── run.py          # Runs the benchmarks on Pietric and other Piet implementations
-    ├── programs.py     # Generates the benchmark programs
-    └── README.md       # Benchmark details and how to run them
+├── bench/
+│   ├── run.py          # Runs the benchmarks on Pietric and other Piet implementations
+│   ├── programs.py     # Generates the benchmark programs
+│   └── README.md       # Benchmark details and how to run them
+└── docs/
+    ├── demo.gif        # The demo above, made by make_demo.sh from demo.tape
+    └── benchmark-*.svg # The benchmark chart above (light and dark), made by make_chart.py
 ```
 
 ## License

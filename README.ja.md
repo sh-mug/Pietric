@@ -4,9 +4,16 @@
 
 **最速の Piet コンパイラ**：生成したプログラムは [PietCC](https://github.com/pwang00/pietcc) の 5〜130 倍、インタプリタ [npiet](https://www.bertnase.de/npiet/) の 150〜4,900 倍の速さで動きます（[ベンチマーク](bench/README.ja.md)）。
 
+![Pietric で Piet のプログラムをコンパイルして実行する様子](docs/demo.gif)
+
 Pietric は、Piet のための C++ 製コンパイラです。Piet は、プログラムを抽象画として描く、スタックベースの難解プログラミング言語です。Pietric は LLVM IR を中間表現とし、そこから機械語を生成します。Piet のスタックと入出力は生成する IR の中に直接実装しているので、LLVM の最適化がすべての操作を見通せます。生成したプログラムが必要とするのは C ライブラリ（POSIX の `write` と `isatty` を含む）だけです。
 
 ## 性能
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmark-dark.svg">
+  <img alt="Piet 製 Brainfuck インタプリタの実行時間" src="docs/benchmark-light.svg">
+</picture>
 
 各行は1つの Piet プログラムで、どの処理系にも同じ入力を与えています。単位は秒で、小さいほど速いです。すべてのベンチマークの結果は [bench/README.ja.md](bench/README.ja.md) にあります。
 
@@ -21,6 +28,20 @@ Pietric は、Piet のための C++ 製コンパイラです。Piet は、プロ
 Pietric と PietCC はコンパイラで、表の時間はコンパイルしたプログラムの実行時間です。[npiet](https://www.bertnase.de/npiet/)、[rpiet](https://github.com/tessi/rpiet)、[piet_programming_language](https://github.com/your-diary/piet_programming_language) はインタプリタです。† は最適化なしの PietCC です（`--o2` ではコンパイルが30分で終わりませんでした）。実行は 600 秒で打ち切っています。計測は Intel Core i5-12400 で行いました。詳細と、手元で再現する方法は [bench/README.ja.md](bench/README.ja.md) を見てください。
 
 ## ビルド
+
+### Docker で使う
+
+Docker イメージには LLVM 20 が入っています。イメージをビルドして、カレントディレクトリのプログラムをコンパイル・実行します。
+```bash
+docker build -t pietric .
+docker run --rm -i -v "$PWD:/work" pietric run program.png
+```
+コンパイルだけする場合（実行ファイルは Linux で動きます）：
+```bash
+docker run --rm -v "$PWD:/work" -u "$(id -u):$(id -g)" pietric program.png -o program
+```
+
+### ソースからビルドする
 
 > [!NOTE]
 > 環境変数 `LLVM_DIR` に、LLVM の CMake 設定ファイルがあるディレクトリを設定してください。CMake が LLVM を見つけるのに使います。
@@ -109,6 +130,7 @@ Pietric は [Piet の仕様](https://www.dangermouse.net/esoteric/piet.html)に�
 ```
 Pietric/
 ├── CMakeLists.txt         # CMake のビルド設定
+├── Dockerfile             # Pietric と LLVM 20 入りの Docker イメージ
 ├── README.md              # このドキュメント（英語）
 ├── README.ja.md           # このドキュメント（日本語）
 ├── .gitignore             # git が無視するファイル・ディレクトリ
@@ -134,10 +156,13 @@ Pietric/
 │   ├── gen_cases.py    # cases/ のテキスト形式のテストプログラムを生成
 │   ├── cases/          # テストプログラムと期待する出力（と入力）
 │   └── README.md       # テストの実行方法と追加方法（日本語は README.ja.md）
-└── bench/
-    ├── run.py          # Pietric と他の Piet 処理系でベンチマークを実行
-    ├── programs.py     # ベンチマーク用のプログラムを生成
-    └── README.md       # ベンチマークの詳細と実行方法（日本語は README.ja.md）
+├── bench/
+│   ├── run.py          # Pietric と他の Piet 処理系でベンチマークを実行
+│   ├── programs.py     # ベンチマーク用のプログラムを生成
+│   └── README.md       # ベンチマークの詳細と実行方法（日本語は README.ja.md）
+└── docs/
+    ├── demo.gif        # 冒頭のデモ（demo.tape から make_demo.sh で作成）
+    └── benchmark-*.svg # 性能の節のグラフ（ライト・ダーク用、make_chart.py で作成）
 ```
 
 ## ライセンス
