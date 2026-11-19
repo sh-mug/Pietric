@@ -1,5 +1,7 @@
 # Tests
 
+English | [日本語](README.ja.md)
+
 The end-to-end tests compile each program in `tests/cases/` with Pietric at `-O0` and at `-O2`, run it and compare its output with the expected output. From the build directory, run:
 ```bash
 ctest --output-on-failure

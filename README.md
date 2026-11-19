@@ -1,5 +1,7 @@
 # Pietric
 
+English | [日本語](README.ja.md)
+
 **The fastest compiler for Piet**: programs run 5–130× faster than with [PietCC](https://github.com/pwang00/pietcc) and 150–4,900× faster than with the [npiet](https://www.bertnase.de/npiet/) interpreter ([benchmarks](bench/README.md)).
 
 Pietric is a C++-centric compiler for the Piet programming language. Piet is an esoteric, stack-based language where programs are painted as abstract images. This compiler uses LLVM IR as its intermediate representation and then generates machine code. The Piet stack and I/O are implemented directly in the generated IR, so LLVM's optimizer can see through every operation, and the resulting program needs nothing but the C library (with the POSIX functions `write` and `isatty`).
@@ -110,6 +112,7 @@ End-to-end tests compile the programs in `tests/cases/`, run them and check thei
 Pietric/
 ├── CMakeLists.txt         # CMake build configuration file
 ├── README.md              # This documentation file
+├── README.ja.md           # This documentation in Japanese
 ├── .gitignore             # Files/directories ignored by git
 ├── include/
 │   ├── PietTypes.h        # Definitions for Piet colors, DP/CC, and commands

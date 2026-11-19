@@ -1,5 +1,7 @@
 # Benchmarks
 
+English | [日本語](README.ja.md)
+
 The tables here and under [Performance](../README.md#performance) come from `bench/run.py`. It runs each program on every implementation with the same input, checks the output, and reports the wall-clock time, start-up included. The time is the median of 3 runs for runs under 20 s, and a single run otherwise. Runs are stopped after 600 s.
 
 The programs:
